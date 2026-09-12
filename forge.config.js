@@ -1,12 +1,9 @@
-const { FusesPlugin } = require('@electron-forge/plugin-fuses');
-const { FuseV1Options, FuseVersion } = require('@electron/fuses');
-
 module.exports = {
   packagerConfig: {
     asar: true,
     prune: true,
     icon: 'assets/app-icon',
-    extraResource: ['./resources/hardware-monitor', './assets'],
+    extraResource: ['./assets'],
   },
   rebuildConfig: {},
   makers: [
