@@ -10,7 +10,8 @@
     "package": "electron-forge package",
     "make": "electron-forge make",
     "publish": "electron-forge publish",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js"
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/lib/safe-filesystem.mjs && node --check src/lib/operation-manager.mjs && node --check src/lib/server-metadata.mjs && node --check src/lib/server-store.mjs && node --check src/lib/server-properties.mjs && node --check src/lib/addon-manager.mjs && node --check src/lib/transfer-manager.mjs && node --check src/lib/external-importer.mjs && node --check src/lib/world-manager.mjs && npm test"
   },
   "keywords": [],
   "author": "nadit",
@@ -26,6 +27,8 @@
     "vite": "^8.0.16"
   },
   "dependencies": {
-    "electron-squirrel-startup": "^1.0.1"
+    "electron-squirrel-startup": "^1.0.1",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1"
   }
 }

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import started from "electron-squirrel-startup";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -8,6 +8,58 @@ import { execFile, spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { atomicWriteFile, commitFileBackup, isPathInside } from "./lib/safe-filesystem.mjs";
+import {
+  createServerFolder as createStoredServerFolder,
+  getSavedServer,
+  getSavedServers as loadSavedServers,
+  normalizeColor,
+  normalizeServerId,
+  normalizeServerName,
+  normalizeServerType,
+  safeSegment,
+  serverTypeLabel,
+  updateServerMetadata,
+  writeServerMetadata,
+} from "./lib/server-store.mjs";
+import {
+  getActiveOperations,
+  subscribeOperations,
+  waitForOperations,
+  withServerOperation,
+} from "./lib/operation-manager.mjs";
+import {
+  loadServerProperties,
+  rollbackServerProperties,
+  saveServerProperties,
+} from "./lib/server-properties.mjs";
+import {
+  checkAddonUpdates,
+  cleanupAbandonedAddonTransactions,
+  commitAddonTransaction,
+  installManualAddon,
+  installModrinthAddon,
+  listServerAddons,
+  removeAddon,
+  recommendCompatibleAddons,
+  rollbackAddonTransaction,
+  rollbackAddonVersion,
+  searchCompatibleAddons,
+  setAddonReleaseChannel,
+  setAddonEnabled,
+  updateAllModrinthAddons,
+  updateModrinthAddon,
+} from "./lib/addon-manager.mjs";
+import {
+  cleanupAbandonedTransfers,
+  exportBlockhostServer,
+  importBlockhostServer,
+} from "./lib/transfer-manager.mjs";
+import {
+  cleanupAbandonedExternalImports,
+  importExternalServer,
+} from "./lib/external-importer.mjs";
+import { exportWorld, importWorld } from "./lib/world-manager.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
@@ -15,7 +67,6 @@ const APP_USER_AGENT = "BlockHostManager/1.0.0";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
-const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
 const ALLOWED_DOWNLOAD_HOSTS = new Set([
   "piston-data.mojang.com",
   "piston-meta.mojang.com",
@@ -27,9 +78,22 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
   "maven.neoforged.net",
 ]);
 const runningServers = new Map();
+const recentExports = new Set();
+const approvedWorldSources = new Map();
 
 let mainWindow;
 let quitInProgress = false;
+let quitAfterTransfers = false;
+let activeTransfers = 0;
+
+async function finishQueuedQuit() {
+  if (!quitAfterTransfers || quitInProgress || activeTransfers > 0) return;
+  await waitForOperations();
+  if (activeTransfers > 0 || quitInProgress) return;
+  quitInProgress = true;
+  await stopAllServers();
+  app.quit();
+}
 
 class MissingJavaError extends Error {
   constructor() {
@@ -38,55 +102,12 @@ class MissingJavaError extends Error {
   }
 }
 
-function readJson(filePath, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function normalizeServerType(value) {
-  return SERVER_TYPES.has(value) ? value : "vanilla";
-}
-
-function serverTypeLabel(type) {
-  return {
-    vanilla: "Vanilla",
-    paper: "Paper",
-    fabric: "Fabric",
-    forge: "Forge",
-    neoforge: "NeoForge",
-  }[type] || "Vanilla";
-}
-
-function normalizeColor(value) {
-  return /^#[0-9a-f]{6}$/i.test(String(value || "")) ? value : DEFAULT_COLOR;
-}
-
-function safeSegment(value, fallback = "item") {
-  const result = String(value || "")
-    .trim()
-    .replace(/[^a-z0-9._-]+/gi, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 100);
-  return result || fallback;
-}
-
-function normalizeServerName(value) {
-  const name = String(value || "").trim().slice(0, 80);
-  if (!name) throw new Error("Server name is required");
-  return name;
-}
-
-function normalizeServerId(value) {
-  const id = Number(value);
-  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Invalid server id");
-  return id;
-}
-
 function getServersRoot() {
   return path.join(app.getPath("userData"), "servers");
+}
+
+function getExportsDirectory() {
+  return path.join(app.getPath("documents"), "BlockHost Exports");
 }
 
 function getCachePath(...segments) {
@@ -97,68 +118,21 @@ function getCachePath(...segments) {
   );
 }
 
-function isInside(parent, child) {
-  const relative = path.relative(path.resolve(parent), path.resolve(child));
-  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
 function getAssetPath(...segments) {
   const root = app.isPackaged ? process.resourcesPath : app.getAppPath();
   return path.join(root, ...segments);
 }
 
-function writeMetadata(serverFolder, server) {
-  fs.writeFileSync(
-    path.join(serverFolder, "server-info.json"),
-    JSON.stringify(server, null, 2),
-    "utf8"
-  );
-}
-
 function getSavedServers() {
-  const root = getServersRoot();
-  if (!fs.existsSync(root)) return [];
-
-  const servers = [];
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const folderPath = path.join(root, entry.name);
-    const metadata = readJson(path.join(folderPath, "server-info.json"));
-    if (!metadata) continue;
-
-    const id = Number(metadata.id || entry.name.split("-").at(-1));
-    if (!Number.isSafeInteger(id)) continue;
-
-    const type = normalizeServerType(metadata.type);
-    servers.push({
-      id,
-      name: String(metadata.name || entry.name),
-      type,
-      typeLabel: serverTypeLabel(type),
-      version: String(metadata.version || "unknown"),
-      loaderVersion: String(metadata.loaderVersion || ""),
-      color: normalizeColor(metadata.color),
-      folderPath,
-      jarPath: String(metadata.jarPath || ""),
-      launchType: metadata.launchType === "javaArgsFile" ? "javaArgsFile" : "jar",
-      launchArgsPath: String(metadata.launchArgsPath || ""),
-      createdAt: String(metadata.createdAt || ""),
-    });
-  }
-
-  return servers.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return loadSavedServers(getServersRoot());
 }
 
 function getServer(id) {
-  const serverId = normalizeServerId(id);
-  return getSavedServers().find((server) => server.id === serverId) || null;
+  return getSavedServer(getServersRoot(), id);
 }
 
 function createServerFolder(name, id) {
-  const root = getServersRoot();
-  const folder = path.join(root, `${safeSegment(name, "server")}-${id}`);
-  fs.mkdirSync(folder, { recursive: true });
-  return folder;
+  return createStoredServerFolder(getServersRoot(), name, id);
 }
 
 function compareVersions(a, b) {
@@ -378,6 +352,9 @@ async function createJarServer(data, type, info, loaderVersion = "") {
   const folder = createServerFolder(name, id);
   try {
     const cached = await cachedDownload(type, data.version, info, `${type}-${data.version}.jar`);
+    const localJar = path.join(folder, "server.jar");
+    fs.copyFileSync(cached.path, localJar, fs.constants.COPYFILE_EXCL);
+    if (data.worldSourcePath) await importWorld(data.worldSourcePath, folder);
     const server = {
       id,
       name,
@@ -387,12 +364,13 @@ async function createJarServer(data, type, info, loaderVersion = "") {
       loaderVersion,
       color: normalizeColor(data.color),
       folderPath: folder,
-      jarPath: cached.path,
+      jarFile: "server.jar",
+      jarPath: localJar,
       launchType: "jar",
       createdAt: new Date().toISOString(),
     };
-    writeMetadata(folder, server);
-    return { success: true, usedCache: cached.usedCache, server };
+    const savedServer = writeServerMetadata(folder, server);
+    return { success: true, usedCache: cached.usedCache, server: savedServer };
   } catch (error) {
     fs.rmSync(folder, { recursive: true, force: true });
     throw error;
@@ -423,6 +401,7 @@ async function installLoaderServer(data, type, loaderVersion, installerUrl) {
     if (!fs.existsSync(path.join(folder, argsRelative))) {
       throw new Error(`${serverTypeLabel(type)} installed without a server launch file`);
     }
+    if (data.worldSourcePath) await importWorld(data.worldSourcePath, folder);
 
     const server = {
       id,
@@ -433,13 +412,12 @@ async function installLoaderServer(data, type, loaderVersion, installerUrl) {
       loaderVersion,
       color: normalizeColor(data.color),
       folderPath: folder,
-      jarPath: cached.path,
       launchType: "javaArgsFile",
       launchArgsPath: argsRelative,
       createdAt: new Date().toISOString(),
     };
-    writeMetadata(folder, server);
-    return { success: true, usedCache: cached.usedCache, server };
+    const savedServer = writeServerMetadata(folder, server);
+    return { success: true, usedCache: cached.usedCache, server: savedServer };
   } catch (error) {
     fs.rmSync(folder, { recursive: true, force: true });
     throw error;
@@ -450,30 +428,36 @@ async function createServer(data = {}) {
   const type = normalizeServerType(data.type);
   const version = String(data.version || "").trim();
   if (!version) throw new Error("Minecraft version is required");
+  const worldToken = String(data.worldImportToken || "");
+  const approvedWorld = worldToken ? approvedWorldSources.get(worldToken) : null;
+  if (worldToken && !approvedWorld) throw new Error("Choose the world import again before downloading the server");
+  const input = { ...data, worldSourcePath: approvedWorld?.path || "" };
+  let result;
 
   if (type === "vanilla") {
-    return createJarServer(data, type, await vanillaDownload(data.versionUrl));
-  }
-  if (type === "paper") {
-    return createJarServer(data, type, await paperDownload(version));
-  }
-  if (type === "fabric") {
+    result = await createJarServer(input, type, await vanillaDownload(input.versionUrl));
+  } else if (type === "paper") {
+    result = await createJarServer(input, type, await paperDownload(version));
+  } else if (type === "fabric") {
     const loader = safeSegment(data.loaderVersion);
     const installer = safeSegment(data.installerVersion);
     const url = `https://meta.fabricmc.net/v2/versions/loader/${encodeURIComponent(version)}/${encodeURIComponent(loader)}/${encodeURIComponent(installer)}/server/jar`;
-    return createJarServer(data, type, {
+    result = await createJarServer(input, type, {
       url,
       fileName: `fabric-server-${version}-${loader}.jar`,
     }, loader);
+  } else {
+    const loader = safeSegment(data.loaderVersion || version);
+    if (type === "forge") {
+      const url = `https://maven.minecraftforge.net/net/minecraftforge/forge/${loader}/forge-${loader}-installer.jar`;
+      result = await installLoaderServer(input, type, loader, url);
+    } else {
+      const url = `https://maven.neoforged.net/releases/net/neoforged/neoforge/${loader}/neoforge-${loader}-installer.jar`;
+      result = await installLoaderServer(input, type, loader, url);
+    }
   }
-
-  const loader = safeSegment(data.loaderVersion || version);
-  if (type === "forge") {
-    const url = `https://maven.minecraftforge.net/net/minecraftforge/forge/${loader}/forge-${loader}-installer.jar`;
-    return installLoaderServer(data, type, loader, url);
-  }
-  const url = `https://maven.neoforged.net/releases/net/neoforged/neoforge/${loader}/neoforge-${loader}-installer.jar`;
-  return installLoaderServer(data, type, loader, url);
+  if (worldToken) approvedWorldSources.delete(worldToken);
+  return result;
 }
 
 function eulaPath(server) {
@@ -526,13 +510,67 @@ function runningEntry() {
   );
 }
 
-function maxMemoryMb() {
+function defaultMaxMemoryMb() {
   const halfSystemMemory = Math.floor(os.totalmem() / 1024 / 1024 / 2 / 512) * 512;
   return Math.max(512, Math.min(4096, halfSystemMemory));
 }
 
+function memoryLimitMb() {
+  const available = Math.floor((os.totalmem() / 1024 / 1024) * 0.8 / 256) * 256;
+  return Math.max(1024, available);
+}
+
+function memorySettings(server) {
+  const limitMb = memoryLimitMb();
+  const defaultMax = Math.min(defaultMaxMemoryMb(), limitMb);
+  const maxMemoryMb = Math.max(512, Math.min(limitMb, Number(server?.maxMemoryMb) || defaultMax));
+  const minMemoryMb = Math.max(512, Math.min(maxMemoryMb, Number(server?.minMemoryMb) || 512));
+  return {
+    minMemoryMb,
+    maxMemoryMb,
+    limitMb,
+    systemMemoryMb: Math.floor(os.totalmem() / 1024 / 1024),
+  };
+}
+
+function getServerMemory(id) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  return memorySettings(server);
+}
+
+function updateServerIdentity(id, input = {}) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  const name = normalizeServerName(input.name);
+  const color = normalizeColor(input.color);
+  const updated = updateServerMetadata(server.folderPath, {
+    name,
+    color,
+    lastModifiedAt: new Date().toISOString(),
+  });
+  return { ...server, ...updated, name, color };
+}
+
+function updateServerMemory(id, input = {}) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  const limitMb = memoryLimitMb();
+  const minMemoryMb = Number(input.minMemoryMb);
+  const maxMemoryMb = Number(input.maxMemoryMb);
+  if (!Number.isSafeInteger(minMemoryMb) || !Number.isSafeInteger(maxMemoryMb)) throw new Error("Choose valid RAM values");
+  if (minMemoryMb < 512 || maxMemoryMb > limitMb || minMemoryMb > maxMemoryMb) {
+    throw new Error(`Choose between 512 MB and ${limitMb} MB, with minimum RAM no higher than maximum RAM`);
+  }
+  if (minMemoryMb % 256 || maxMemoryMb % 256) throw new Error("RAM values must use 256 MB steps");
+  updateServerMetadata(server.folderPath, { minMemoryMb, maxMemoryMb, lastModifiedAt: new Date().toISOString() });
+  Object.assign(server, { minMemoryMb, maxMemoryMb });
+  return { ...memorySettings(server), appliesOnNextStart: Boolean(runningServers.get(server.id)?.process) };
+}
+
 function launchCommand(server) {
-  const common = [`-Dblockhost.serverId=${server.id}`, `-Xmx${maxMemoryMb()}M`];
+  const memory = memorySettings(server);
+  const common = [`-Dblockhost.serverId=${server.id}`, `-Xms${memory.minMemoryMb}M`, `-Xmx${memory.maxMemoryMb}M`];
   if (server.launchType === "javaArgsFile") {
     const absoluteArgs = path.isAbsolute(server.launchArgsPath)
       ? server.launchArgsPath
@@ -587,7 +625,8 @@ async function startServer(id, options = {}) {
   });
   runtime.process = child;
   runningServers.set(serverId, runtime);
-  appendLog(runtime, `[APP] Starting ${server.name} with ${maxMemoryMb()} MB maximum RAM...`);
+  const configuredMemory = memorySettings(server);
+  appendLog(runtime, `[APP] Starting ${server.name} with ${configuredMemory.minMemoryMb} MB minimum and ${configuredMemory.maxMemoryMb} MB maximum RAM...`);
 
   const handleOutput = (chunk) => {
     chunk.toString().split(/\r?\n/).forEach((line) => {
@@ -646,6 +685,446 @@ function sendCommand(id, value) {
   runtime.process.stdin.write(`${command}\n`);
   appendLog(runtime, `> ${command}`);
   return runtimeSnapshot(serverId);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForServerReady(id, timeoutMilliseconds = 240_000) {
+  const serverId = normalizeServerId(id);
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    const runtime = runningServers.get(serverId);
+    if (runtime?.status === "running") return runtimeSnapshot(serverId);
+    if (!runtime || runtime.status === "offline") {
+      const lastLine = runtime?.logs?.at(-1);
+      throw new Error(lastLine || "The server stopped before it finished starting");
+    }
+    await delay(250);
+  }
+  throw new Error("The server did not finish starting within four minutes");
+}
+
+async function restartAndWait(id) {
+  const startedRuntime = await startServer(id);
+  if (startedRuntime.requiresEula) {
+    throw new Error("The Minecraft EULA must be accepted before the server can restart");
+  }
+  if (startedRuntime.requiresServerSwitch) {
+    throw new Error("Another server started while these settings were being saved");
+  }
+  return waitForServerReady(id);
+}
+
+function getProperties(id) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  return loadServerProperties(server.folderPath, server.version);
+}
+
+async function updateProperties(id, data = {}) {
+  const serverId = normalizeServerId(id);
+  return withServerOperation(serverId, "updating its properties", async () => {
+    const server = getServer(serverId);
+    if (!server) throw new Error("Saved server not found");
+
+    const runtime = runningServers.get(serverId);
+    const wasRunning = Boolean(runtime?.process && runtime.status !== "offline");
+    const shouldRestart = wasRunning && Boolean(data.restart);
+    if (shouldRestart) await stopServer(serverId);
+
+    let saved;
+    try {
+      saved = saveServerProperties(server.folderPath, {
+        mode: data.mode,
+        values: data.values,
+        customProperties: data.customProperties,
+        rawText: data.rawText,
+      }, server.version);
+    } catch (error) {
+      if (shouldRestart) {
+        try {
+          await restartAndWait(serverId);
+        } catch (recoveryError) {
+          throw new Error(
+            `${error.message}. The original server could not be restarted: ${recoveryError.message}`
+          );
+        }
+      }
+      throw error;
+    }
+
+    if (shouldRestart) {
+      try {
+        await restartAndWait(serverId);
+      } catch (startError) {
+        try {
+          await stopServer(serverId);
+          rollbackServerProperties(saved.transaction);
+        } catch (rollbackError) {
+          throw new Error(
+            `The new properties prevented startup, and automatic recovery failed: ${rollbackError.message}`
+          );
+        }
+
+        try {
+          await restartAndWait(serverId);
+        } catch (recoveryError) {
+          throw new Error(
+            `The new properties were rolled back, but the server could not be restarted: ${recoveryError.message}`
+          );
+        }
+        commitFileBackup(saved.transaction);
+        throw new Error(
+          `The server could not start with the new properties, so the previous properties were restored. ${startError.message}`
+        );
+      }
+    }
+
+    updateServerMetadata(server.folderPath, {
+      lastModifiedAt: new Date().toISOString(),
+    });
+    commitFileBackup(saved.transaction);
+    return {
+      properties: loadServerProperties(server.folderPath, server.version),
+      runtime: runtimeSnapshot(serverId),
+      restarted: shouldRestart,
+      appliesOnNextStart: wasRunning && !shouldRestart,
+    };
+  });
+}
+
+function getAddons(id) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  return listServerAddons(server);
+}
+
+function addonSearchCachePath() {
+  return path.join(app.getPath("userData"), "addon-search-cache.json");
+}
+
+function readAddonSearchCache() {
+  try {
+    const value = JSON.parse(fs.readFileSync(addonSearchCachePath(), "utf8"));
+    return value && typeof value === "object" ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+async function searchAddonsWithCache(server, query, recommendations = false) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  const key = `${server.type}:${server.version}:${recommendations ? "recommended" : normalizedQuery}`;
+  const cache = readAddonSearchCache();
+  try {
+    const result = recommendations
+      ? await recommendCompatibleAddons(server)
+      : await searchCompatibleAddons(server, query);
+    cache[key] = { savedAt: new Date().toISOString(), result };
+    const entries = Object.entries(cache).slice(-100);
+    atomicWriteFile(addonSearchCachePath(), `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`);
+    return { ...result, cached: false, offline: false };
+  } catch (error) {
+    if (cache[key]?.result) {
+      return { ...cache[key].result, cached: true, offline: true, offlineMessage: "Internet connection unavailable. Showing cached results." };
+    }
+    throw new Error(`Internet connection required to search add-ons. No files were changed. ${error.message}`);
+  }
+}
+
+async function applyAddonChange(id, operation, mutation) {
+  const serverId = normalizeServerId(id);
+  return withServerOperation(serverId, operation, async () => {
+    const server = getServer(serverId);
+    if (!server) throw new Error("Saved server not found");
+    const runtime = runningServers.get(serverId);
+    const wasRunning = Boolean(runtime?.process && runtime.status !== "offline");
+    if (wasRunning) await stopServer(serverId);
+
+    let result;
+    try {
+      result = await mutation(server);
+    } catch (error) {
+      if (wasRunning) {
+        try {
+          await restartAndWait(serverId);
+        } catch (recoveryError) {
+          throw new Error(`${error.message}. The unchanged server could not be restarted: ${recoveryError.message}`);
+        }
+      }
+      throw error;
+    }
+
+    if (wasRunning) {
+      try {
+        await restartAndWait(serverId);
+      } catch (startError) {
+        try {
+          await stopServer(serverId);
+          rollbackAddonTransaction(result.transaction);
+        } catch (rollbackError) {
+          throw new Error(`The add-on change prevented startup, and automatic recovery failed: ${rollbackError.message}`);
+        }
+        try {
+          await restartAndWait(serverId);
+        } catch (recoveryError) {
+          throw new Error(`The add-on change was rolled back, but the server could not be restarted: ${recoveryError.message}`);
+        }
+        throw new Error(`The server could not start with the add-on change, so it was rolled back. ${startError.message}`);
+      }
+    }
+
+    commitAddonTransaction(result.transaction);
+    updateServerMetadata(server.folderPath, { lastModifiedAt: new Date().toISOString() });
+    return {
+      addons: listServerAddons(server),
+      runtime: runtimeSnapshot(serverId),
+      restarted: wasRunning,
+      cancelled: false,
+      warnings: result.warnings || [],
+      removed: result.removed || [],
+      updated: Number(result.updated) || 0,
+    };
+  });
+}
+
+async function installManualAddonFromDialog(id) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "Install a server add-on",
+    buttonLabel: "Install add-on",
+    properties: ["openFile"],
+    filters: [{ name: "Java add-ons", extensions: ["jar"] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) {
+    return { cancelled: true, addons: listServerAddons(server), runtime: runtimeSnapshot(id), restarted: false };
+  }
+  return applyAddonChange(id, "installing an add-on", (currentServer) =>
+    installManualAddon(currentServer, selection.filePaths[0])
+  );
+}
+
+async function installManualAddonFromPath(id, filePath) {
+  if (!filePath) throw new Error("No add-on file was provided");
+  return applyAddonChange(id, "installing an add-on", (server) => installManualAddon(server, filePath));
+}
+
+function sendTransferProgress(kind, serverId, progress) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("transfers:progress", {
+    kind,
+    serverId: serverId || null,
+    ...progress,
+  });
+}
+
+function safeExportFileName(value) {
+  const name = String(value || "Minecraft server")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "-")
+    .replace(/[. ]+$/g, "")
+    .trim()
+    .slice(0, 100);
+  return name || "Minecraft server";
+}
+
+function nextExportPath(server) {
+  const directory = getExportsDirectory();
+  fs.mkdirSync(directory, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const base = `${safeExportFileName(server.name)} ${timestamp}`;
+  let destination = path.join(directory, `${base}.blockhost`);
+  let suffix = 2;
+  while (fs.existsSync(destination)) {
+    destination = path.join(directory, `${base} (${suffix}).blockhost`);
+    suffix += 1;
+  }
+  return destination;
+}
+
+async function chooseWorldImportSource() {
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose a Minecraft world",
+    buttonLabel: "Use this world",
+    properties: ["openFile", "openDirectory"],
+    filters: [{ name: "Minecraft world ZIPs", extensions: ["zip"] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return { cancelled: true };
+  const selectedPath = path.resolve(selection.filePaths[0]);
+  const stats = fs.statSync(selectedPath);
+  if (!stats.isDirectory() && path.extname(selectedPath).toLowerCase() !== ".zip") {
+    throw new Error("Choose a Minecraft world folder or ZIP file");
+  }
+  const token = crypto.randomUUID();
+  approvedWorldSources.set(token, { path: selectedPath, createdAt: Date.now() });
+  for (const [key, value] of approvedWorldSources) {
+    if (Date.now() - value.createdAt > 60 * 60 * 1000) approvedWorldSources.delete(key);
+  }
+  return { token, label: path.basename(selectedPath), kind: stats.isDirectory() ? "folder" : "zip" };
+}
+
+async function runTrackedTransfer(task) {
+  activeTransfers += 1;
+  try {
+    return await task();
+  } finally {
+    activeTransfers -= 1;
+    finishQueuedQuit();
+  }
+}
+
+async function exportServerArchive(id, requestedDestination = "") {
+  const serverId = normalizeServerId(id);
+  const server = getServer(serverId);
+  if (!server) throw new Error("Saved server not found");
+  const runtime = runningServers.get(serverId);
+  const wasRunning = Boolean(runtime?.process && runtime.status !== "offline");
+  const destination = requestedDestination ? path.resolve(requestedDestination) : nextExportPath(server);
+  let result;
+  let exportError;
+  let restartError;
+
+  sendTransferProgress("export", serverId, { stage: "prepare", percent: 0, message: wasRunning ? "Stopping the server safely…" : "Preparing the export…" });
+  if (wasRunning) await stopServer(serverId);
+  try {
+    result = await exportBlockhostServer(server, destination, {
+      createdBy: `${APP_NAME} ${app.getVersion()}`,
+      onProgress: (progress) => sendTransferProgress("export", serverId, progress),
+    });
+    recentExports.add(result.path);
+  } catch (error) {
+    exportError = error;
+  } finally {
+    if (wasRunning) {
+      sendTransferProgress("export", serverId, { stage: "restart", percent: 99, message: "Restarting the server…" });
+      try { await restartAndWait(serverId); }
+      catch (error) { restartError = error; }
+    }
+  }
+
+  if (exportError) {
+    if (restartError) throw new Error(`${exportError.message}. Export failed and the server could not be restarted: ${restartError.message}`);
+    throw exportError;
+  }
+  return {
+    ...result,
+    serverName: server.name,
+    restarted: wasRunning && !restartError,
+    restartError: restartError?.message || "",
+  };
+}
+
+async function exportServerAs(id) {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  const selection = await dialog.showSaveDialog(mainWindow, {
+    title: "Export BlockHost server as",
+    buttonLabel: "Export server",
+    defaultPath: path.join(getExportsDirectory(), `${safeExportFileName(server.name)}.blockhost`),
+    filters: [{ name: "BlockHost server archives", extensions: ["blockhost"] }],
+  });
+  if (selection.canceled || !selection.filePath) return { cancelled: true };
+  const destination = selection.filePath.toLowerCase().endsWith(".blockhost")
+    ? selection.filePath
+    : `${selection.filePath}.blockhost`;
+  return exportServerArchive(id, destination);
+}
+
+async function exportServerWorld(id) {
+  const serverId = normalizeServerId(id);
+  const server = getServer(serverId);
+  if (!server) throw new Error("Saved server not found");
+  const selection = await dialog.showSaveDialog(mainWindow, {
+    title: "Export Minecraft world",
+    buttonLabel: "Export world",
+    defaultPath: path.join(getExportsDirectory(), `${safeExportFileName(server.name)} world.zip`),
+    filters: [{ name: "Minecraft world archives", extensions: ["zip"] }],
+  });
+  if (selection.canceled || !selection.filePath) return { cancelled: true };
+  const destination = selection.filePath.toLowerCase().endsWith(".zip") ? selection.filePath : `${selection.filePath}.zip`;
+  const runtime = runningServers.get(serverId);
+  const wasRunning = Boolean(runtime?.process && runtime.status !== "offline");
+  let result;
+  let exportError;
+  let restartError;
+  sendTransferProgress("world-export", serverId, { stage: "prepare", percent: 0, message: wasRunning ? "Stopping the server safely…" : "Preparing the world export…" });
+  if (wasRunning) await stopServer(serverId);
+  try {
+    result = await exportWorld(server.folderPath, destination, {
+      onProgress: (progress) => sendTransferProgress("world-export", serverId, progress),
+    });
+    recentExports.add(result.path);
+  } catch (error) {
+    exportError = error;
+  } finally {
+    if (wasRunning) {
+      sendTransferProgress("world-export", serverId, { stage: "restart", percent: 99, message: "Restarting the server…" });
+      try { await restartAndWait(serverId); }
+      catch (error) { restartError = error; }
+    }
+  }
+  if (exportError) {
+    if (restartError) throw new Error(`${exportError.message}. The world export failed and the server could not be restarted: ${restartError.message}`);
+    throw exportError;
+  }
+  return {
+    ...result,
+    kind: "world-export",
+    serverName: server.name,
+    restarted: wasRunning && !restartError,
+    restartError: restartError?.message || "",
+  };
+}
+
+async function importServerArchive(filePath) {
+  const selectedPath = path.resolve(String(filePath || ""));
+  if (path.extname(selectedPath).toLowerCase() !== ".blockhost") throw new Error("Select a .blockhost server archive");
+  const result = await importBlockhostServer(selectedPath, getServersRoot(), getSavedServers(), {
+    onProgress: (progress) => sendTransferProgress("import", null, progress),
+  });
+  const server = getServer(result.server.id);
+  if (!server) throw new Error("The server was restored but could not be loaded");
+  return { ...result, server };
+}
+
+async function importServerFromDialog() {
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "Import a BlockHost server",
+    buttonLabel: "Import server",
+    properties: ["openFile"],
+    filters: [{ name: "BlockHost server archives", extensions: ["blockhost"] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return { cancelled: true };
+  return withServerOperation(0, "importing a server", () => importServerArchive(selection.filePaths[0]));
+}
+
+async function importExternalServerPath(filePath) {
+  const result = await importExternalServer(filePath, getServersRoot(), getSavedServers(), {
+    onProgress: (value) => sendTransferProgress("external-import", null, value),
+  });
+  const server = getServer(result.server.id);
+  if (!server) throw new Error("The external server was imported but could not be loaded");
+  return { ...result, server };
+}
+
+async function importExternalServerFromDialog() {
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "Import an existing Minecraft server",
+    buttonLabel: "Import detected server",
+    properties: ["openFile", "openDirectory"],
+    filters: [{ name: "Minecraft server ZIPs", extensions: ["zip"] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return { cancelled: true };
+  return withServerOperation(0, "importing an external server", () => importExternalServerPath(selection.filePaths[0]));
+}
+
+function openExportFolder(filePath) {
+  const resolved = path.resolve(String(filePath || ""));
+  if (!recentExports.has(resolved) || !fs.existsSync(resolved)) throw new Error("That export is no longer available");
+  shell.showItemInFolder(resolved);
+  return { opened: true };
 }
 
 async function getWindowsUsage(pids) {
@@ -716,7 +1195,7 @@ async function deleteServer(id) {
   const server = getServer(serverId);
   if (!server) return { deleted: false };
   const root = getServersRoot();
-  if (!isInside(root, server.folderPath)) throw new Error("Refusing to delete an unexpected folder");
+  if (!isPathInside(root, server.folderPath)) throw new Error("Refusing to delete an unexpected folder");
   fs.rmSync(server.folderPath, { recursive: true, force: true });
   runningServers.delete(serverId);
   return { deleted: true };
@@ -733,6 +1212,14 @@ function createWindow() {
     height: 820,
     minWidth: 900,
     minHeight: 650,
+    titleBarStyle: "hidden",
+    titleBarOverlay: {
+      color: "#07111d",
+      symbolColor: "#7890a8",
+      height: 40,
+    },
+    autoHideMenuBar: true,
+    backgroundColor: "#08101d",
     icon: getAssetPath("assets", "app-icon.png"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -741,6 +1228,7 @@ function createWindow() {
       sandbox: true,
     },
   });
+  mainWindow.removeMenu();
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url === MINECRAFT_EULA_URL || url.startsWith("https://adoptium.net/")) {
@@ -763,7 +1251,14 @@ function createWindow() {
 if (started) app.quit();
 
 app.whenReady().then(() => {
+  cleanupAbandonedTransfers(getServersRoot(), getExportsDirectory());
+  cleanupAbandonedAddonTransactions(getServersRoot());
+  cleanupAbandonedExternalImports(getServersRoot());
   createWindow();
+  subscribeOperations((operations) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("operations:state", operations);
+    finishQueuedQuit();
+  });
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
@@ -774,7 +1269,14 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", (event) => {
-  if (quitInProgress || !runningEntry()) return;
+  if (quitInProgress) return;
+  if (activeTransfers > 0 || getActiveOperations().length > 0) {
+    event.preventDefault();
+    quitAfterTransfers = true;
+    finishQueuedQuit();
+    return;
+  }
+  if (!runningEntry()) return;
   event.preventDefault();
   quitInProgress = true;
   stopAllServers().finally(() => app.quit());
@@ -783,14 +1285,114 @@ app.on("before-quit", (event) => {
 ipcMain.handle("servers:getVersionOptions", (_event, options) =>
   getVersionOptions(options?.type)
 );
-ipcMain.handle("servers:create", (_event, data) => createServer(data));
+ipcMain.handle("servers:create", (_event, data) =>
+  withServerOperation(-1, "downloading a server", () => createServer(data))
+);
 ipcMain.handle("servers:getSaved", () => getSavedServers());
 ipcMain.handle("servers:getRuntimeState", (_event, id) => runtimeSnapshot(id));
 ipcMain.handle("servers:getUsage", () => getUsage());
-ipcMain.handle("servers:start", (_event, data) => startServer(data?.id, {
-  acceptEula: Boolean(data?.acceptEula),
-  forceSwitch: Boolean(data?.forceSwitch),
-}));
-ipcMain.handle("servers:stop", (_event, id) => stopServer(id));
+ipcMain.handle("operations:getActive", () => getActiveOperations());
+ipcMain.handle("servers:start", (_event, data) =>
+  withServerOperation(data?.id, "starting", () => startServer(data?.id, {
+    acceptEula: Boolean(data?.acceptEula),
+    forceSwitch: Boolean(data?.forceSwitch),
+  }))
+);
+ipcMain.handle("servers:stop", (_event, id) =>
+  withServerOperation(id, "stopping", () => stopServer(id))
+);
 ipcMain.handle("servers:sendCommand", (_event, data) => sendCommand(data?.id, data?.command));
-ipcMain.handle("servers:delete", (_event, id) => deleteServer(id));
+ipcMain.handle("servers:delete", (_event, id) =>
+  withServerOperation(id, "being deleted", () => deleteServer(id))
+);
+ipcMain.handle("servers:getProperties", (_event, id) => getProperties(id));
+ipcMain.handle("servers:updateProperties", (_event, data) =>
+  updateProperties(data?.id, data)
+);
+ipcMain.handle("servers:getMemory", (_event, id) => getServerMemory(id));
+ipcMain.handle("servers:updateMemory", (_event, data) =>
+  withServerOperation(data?.id, "updating memory settings", () => updateServerMemory(data?.id, data))
+);
+ipcMain.handle("servers:updateIdentity", (_event, data) =>
+  withServerOperation(data?.id, "updating server details", () => updateServerIdentity(data?.id, data))
+);
+ipcMain.handle("worlds:chooseImportSource", () => chooseWorldImportSource());
+ipcMain.handle("worlds:export", (_event, id) =>
+  withServerOperation(id, "exporting the world", () => runTrackedTransfer(() => exportServerWorld(id)))
+);
+ipcMain.handle("addons:list", (_event, id) => getAddons(id));
+ipcMain.handle("addons:recommendations", (_event, id) => {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  return searchAddonsWithCache(server, "", true);
+});
+ipcMain.handle("addons:search", (_event, data) => {
+  const server = getServer(data?.id);
+  if (!server) throw new Error("Saved server not found");
+  return searchAddonsWithCache(server, data?.query);
+});
+ipcMain.handle("addons:install", (_event, data) =>
+  applyAddonChange(data?.id, "installing an add-on", (server) =>
+    installModrinthAddon(server, {
+      projectId: String(data?.projectId || ""),
+      title: String(data?.title || "Selected add-on"),
+      iconUrl: String(data?.iconUrl || ""),
+    })
+  )
+);
+ipcMain.handle("addons:installManual", (_event, id) => installManualAddonFromDialog(id));
+ipcMain.handle("addons:installManualPath", (_event, data) =>
+  installManualAddonFromPath(data?.id, data?.filePath)
+);
+ipcMain.handle("addons:setEnabled", (_event, data) =>
+  applyAddonChange(data?.id, data?.enabled ? "enabling an add-on" : "disabling an add-on", (server) =>
+    setAddonEnabled(server, String(data?.addonId || ""), Boolean(data?.enabled), { cascade: Boolean(data?.cascade) })
+  )
+);
+ipcMain.handle("addons:remove", (_event, data) =>
+  applyAddonChange(data?.id, "removing an add-on", (server) =>
+    removeAddon(server, String(data?.addonId || ""), { cascade: Boolean(data?.cascade) })
+  )
+);
+ipcMain.handle("addons:checkUpdates", (_event, id) => {
+  const server = getServer(id);
+  if (!server) throw new Error("Saved server not found");
+  return withServerOperation(id, "checking add-on updates", () => checkAddonUpdates(server));
+});
+ipcMain.handle("addons:update", (_event, data) =>
+  applyAddonChange(data?.id, "updating an add-on", (server) =>
+    updateModrinthAddon(server, String(data?.addonId || ""))
+  )
+);
+ipcMain.handle("addons:updateAll", (_event, id) =>
+  applyAddonChange(id, "updating all add-ons", (server) => updateAllModrinthAddons(server))
+);
+ipcMain.handle("addons:setReleaseChannel", (_event, data) =>
+  withServerOperation(data?.id, "changing the add-on release channel", () => {
+    const server = getServer(data?.id);
+    if (!server) throw new Error("Saved server not found");
+    const result = setAddonReleaseChannel(server, String(data?.releaseChannel || "stable"));
+    commitAddonTransaction(result.transaction);
+    return { addons: result.addons, runtime: runtimeSnapshot(data?.id), restarted: false };
+  })
+);
+ipcMain.handle("addons:rollback", (_event, data) =>
+  applyAddonChange(data?.id, "rolling back an add-on", (server) =>
+    rollbackAddonVersion(server, String(data?.addonId || ""), String(data?.versionId || ""))
+  )
+);
+ipcMain.handle("transfers:export", (_event, id) =>
+  runTrackedTransfer(() => withServerOperation(id, "being exported", () => exportServerArchive(id)))
+);
+ipcMain.handle("transfers:exportAs", (_event, id) =>
+  runTrackedTransfer(() => withServerOperation(id, "being exported", () => exportServerAs(id)))
+);
+ipcMain.handle("transfers:importDialog", () => runTrackedTransfer(() => importServerFromDialog()));
+ipcMain.handle("transfers:importExternalDialog", () => runTrackedTransfer(() => importExternalServerFromDialog()));
+ipcMain.handle("transfers:importPath", (_event, filePath) =>
+  runTrackedTransfer(() => withServerOperation(0, "importing a server", () => importServerArchive(filePath)))
+);
+ipcMain.handle("transfers:importExternalPath", (_event, filePath) =>
+  runTrackedTransfer(() => withServerOperation(0, "importing an external server", () => importExternalServerPath(filePath)))
+);
+ipcMain.handle("transfers:openExportFolder", (_event, filePath) => openExportFolder(filePath));
