@@ -65,7 +65,7 @@ import { cleanupManagedJavaArtifacts, findJavaExecutable, installManagedJava, is
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
-const APP_USER_AGENT = "BlockHostManager/1.0.4";
+const APP_USER_AGENT = "BlockHostManager/1.0.5";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
@@ -284,24 +284,28 @@ async function installJavaDependency(javaVersionValue = 25) {
   const javaVersion = Number(javaVersionValue) >= 25 ? 25 : 21;
   if (javaInstallPromise) return javaInstallPromise;
   let lastProgressKey = "";
+  const sendJavaProgress = (progress) => {
+    const progressKey = `${progress.stage}:${progress.percent}`;
+    if (progressKey === lastProgressKey) return;
+    lastProgressKey = progressKey;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dependencies:progress", progress);
+  };
   javaInstallPromise = installManagedJava({
     runtimeRoot: getManagedRuntimeRoot(),
     javaVersion,
     validateJava: (command) => probeJava(command, javaVersion),
-    onProgress: (progress) => {
-      const progressKey = `${progress.stage}:${progress.percent}`;
-      if (progressKey === lastProgressKey) return;
-      lastProgressKey = progressKey;
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dependencies:progress", progress);
-    },
-  }).then((result) => ({
-    ready: true,
-    source: "managed",
-    requiredVersion: javaVersion,
-    autoInstallAvailable: true,
-    command: result.executable,
-    details: result.details,
-  })).finally(() => { javaInstallPromise = null; });
+    onProgress: sendJavaProgress,
+  }).then((result) => {
+    sendJavaProgress({ stage: "complete", percent: 100, message: `Java ${javaVersion} is ready.` });
+    return {
+      ready: true,
+      source: "managed",
+      requiredVersion: javaVersion,
+      autoInstallAvailable: true,
+      command: result.executable,
+      details: result.details,
+    };
+  }).finally(() => { javaInstallPromise = null; });
   return javaInstallPromise;
 }
 

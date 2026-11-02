@@ -1,7 +1,7 @@
 {
   "name": "blockhost-manager",
   "productName": "BlockHost Manager",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Minecraft server hosting management for local server.jar instances",
   "main": ".vite/build/main.js",
   "private": true,

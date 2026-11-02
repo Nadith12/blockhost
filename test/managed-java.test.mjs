@@ -40,11 +40,13 @@ test("managed Java installation verifies and activates an app-private runtime", 
     return new Response(archive, { status: 200 });
   };
   let validated = "";
+  const progress = [];
   const result = await installManagedJava({
     runtimeRoot: root,
     javaVersion: 21,
     fetchImpl,
     validateJava: async (executable) => { validated = executable; },
+    onProgress: (event) => progress.push(event),
   });
   assert.equal(request, 2);
   assert.equal(result.executable, path.join(root, "java-21", "jdk-21", "bin", "java.exe"));
@@ -52,6 +54,8 @@ test("managed Java installation verifies and activates an app-private runtime", 
   assert.equal(findJavaExecutable(path.join(root, "java-21"), "win32"), result.executable);
   assert.equal(isManagedJavaReady(path.join(root, "java-21")), true);
   assert.equal(fs.readFileSync(result.executable, "utf8"), "test-java");
+  assert.equal(progress.at(-1).stage, "finalize");
+  assert.equal(progress.at(-1).percent, 98);
   assert.deepEqual(fs.readdirSync(root), ["java-21"]);
 });
 

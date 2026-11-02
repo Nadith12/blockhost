@@ -1593,9 +1593,12 @@ function bindEvents() {
     try {
       const status = await window.minecraftAPI.installJava(requestedJavaVersion);
       if (!status?.ready) throw new Error(status?.reason || "Java setup did not complete");
-      state.javaSetup = null;
-      showNotice(`Java ${status.requiredVersion || 25} is ready. BlockHost can now run servers.`);
+      if (state.javaSetup) {
+        state.javaSetup = null;
+        showNotice(`Java ${status.requiredVersion || requestedJavaVersion} is ready. BlockHost can now run servers.`);
+      }
     } catch (error) {
+      if (!state.javaSetup) return;
       state.javaSetup = { required: true, requiredVersion: requestedJavaVersion, installing: false, progress: null, error: error.message || "Java setup failed" };
       render();
     }
@@ -1774,6 +1777,12 @@ window.minecraftAPI.onOperationsChanged((operations) => {
 
 window.minecraftAPI.onDependencyProgress((progress) => {
   if (!state.javaSetup?.installing) return;
+  if (progress?.stage === "complete" && Number(progress.percent) >= 100) {
+    const completedVersion = state.javaSetup.requiredVersion || 25;
+    state.javaSetup = null;
+    showNotice(`Java ${completedVersion} is ready. BlockHost can now run servers.`);
+    return;
+  }
   state.javaSetup.progress = progress;
   render();
 });
