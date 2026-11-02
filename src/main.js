@@ -60,6 +60,7 @@ import {
   importExternalServer,
 } from "./lib/external-importer.mjs";
 import { exportWorld, importWorld } from "./lib/world-manager.mjs";
+import { assertSupportedJavaRuntime, parseJavaRuntimeDetails } from "./lib/java-runtime.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
@@ -230,7 +231,11 @@ async function cachedDownload(type, version, info, fallbackName) {
 
 async function assertJavaInstalled() {
   try {
-    await execFileAsync("java", ["-version"], { windowsHide: true, maxBuffer: 1024 * 1024 });
+    const result = await execFileAsync("java", ["-XshowSettings:properties", "-version"], {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    return assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`));
   } catch (error) {
     if (error.code === "ENOENT") throw new MissingJavaError();
     throw error;
@@ -494,7 +499,7 @@ function runtimeSnapshot(id) {
   return {
     serverId,
     status: runtime?.status || "offline",
-    pid: runtime?.process?.pid || null,
+    pid: runtime?.status !== "offline" ? runtime?.process?.pid || null : null,
     startedAt: runtime?.startedAt || null,
     stoppedAt: runtime?.stoppedAt || null,
     exitCode: runtime?.exitCode ?? null,
@@ -639,12 +644,14 @@ async function startServer(id, options = {}) {
   child.on("error", (error) => {
     runtime.status = "offline";
     runtime.stoppedAt = new Date().toISOString();
+    runtime.process = null;
     appendLog(runtime, `[APP] Start failed: ${error.message}`);
   });
   child.on("exit", (code) => {
     runtime.status = "offline";
     runtime.stoppedAt = new Date().toISOString();
     runtime.exitCode = code;
+    runtime.process = null;
     appendLog(runtime, `[APP] Server stopped (exit code ${code ?? "unknown"}).`);
   });
   return runtimeSnapshot(serverId);

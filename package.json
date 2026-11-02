@@ -1,7 +1,7 @@
 {
   "name": "blockhost-manager",
   "productName": "BlockHost Manager",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Minecraft server hosting management for local server.jar instances",
   "main": ".vite/build/main.js",
   "private": true,
@@ -11,7 +11,7 @@
     "make": "electron-forge make",
     "publish": "electron-forge publish",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/lib/safe-filesystem.mjs && node --check src/lib/operation-manager.mjs && node --check src/lib/server-metadata.mjs && node --check src/lib/server-store.mjs && node --check src/lib/server-properties.mjs && node --check src/lib/addon-manager.mjs && node --check src/lib/transfer-manager.mjs && node --check src/lib/external-importer.mjs && node --check src/lib/world-manager.mjs && npm test"
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/renderer.js && node --check src/lib/safe-filesystem.mjs && node --check src/lib/operation-manager.mjs && node --check src/lib/server-metadata.mjs && node --check src/lib/server-store.mjs && node --check src/lib/server-properties.mjs && node --check src/lib/addon-manager.mjs && node --check src/lib/transfer-manager.mjs && node --check src/lib/external-importer.mjs && node --check src/lib/world-manager.mjs && node --check src/lib/java-runtime.mjs && npm test"
   },
   "keywords": [],
   "author": "nadit",

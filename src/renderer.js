@@ -2,7 +2,7 @@ import "./index.css";
 import appIconUrl from "../assets/app-icon.png";
 
 const root = document.getElementById("app");
-const JAVA_URL = "https://adoptium.net/temurin/releases/?package=jdk";
+const JAVA_URL = "https://adoptium.net/temurin/releases/?version=21&os=windows&arch=x64&package=jdk";
 const NOTICE_DURATION_MS = 4500;
 let noticeTimer = null;
 
@@ -284,7 +284,11 @@ async function startServer(options = {}) {
     }
     state.runtime = runtime;
   } catch (error) {
-    if (/Java is not installed|available on PATH/i.test(error.message || "")) {
+    const message = error.message || "";
+    if (/64-bit Java is required|32-bit Java runtime/i.test(message)) {
+      state.pendingStart = { kind: "java-architecture" };
+      render();
+    } else if (/Java is not installed|available on PATH/i.test(message)) {
       state.pendingStart = { kind: "java" };
       render();
     } else {
@@ -1276,11 +1280,19 @@ function renderStartModal() {
         <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Cancel</button><button class="primary" id="confirmSwitch" type="button">Stop and switch</button></div>
       </section></div>`;
   }
+  if (state.pendingStart.kind === "java-architecture") {
+    return `
+      <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="javaTitle">
+        <h2 id="javaTitle">64-bit Java is required</h2>
+        <p>BlockHost found a 32-bit Java runtime. It cannot allocate enough memory for this server. Install 64-bit Java 21, then fully reopen BlockHost Manager.</p>
+        <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 21</a></div>
+      </section></div>`;
+  }
   return `
     <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="javaTitle">
       <h2 id="javaTitle">Java is required</h2>
-      <p>Install a current JDK, then reopen BlockHost Manager.</p>
-      <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get Java</a></div>
+      <p>Install 64-bit Java 21, then reopen BlockHost Manager.</p>
+      <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 21</a></div>
     </section></div>`;
 }
 
