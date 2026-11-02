@@ -21,6 +21,7 @@ const state = {
   versionsError: "",
   pendingAction: "",
   pendingStart: null,
+  javaSetup: null,
   deleteId: null,
   propertiesOpen: false,
   propertiesLoading: false,
@@ -285,11 +286,8 @@ async function startServer(options = {}) {
     state.runtime = runtime;
   } catch (error) {
     const message = error.message || "";
-    if (/64-bit Java is required|32-bit Java runtime/i.test(message)) {
-      state.pendingStart = { kind: "java-architecture" };
-      render();
-    } else if (/Java is not installed|available on PATH/i.test(message)) {
-      state.pendingStart = { kind: "java" };
+    if (/Java|JDK|JRE/i.test(message)) {
+      state.javaSetup = { required: true, installing: false, progress: null, error: "", reason: message };
       render();
     } else {
       showError(error);
@@ -1280,19 +1278,32 @@ function renderStartModal() {
         <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Cancel</button><button class="primary" id="confirmSwitch" type="button">Stop and switch</button></div>
       </section></div>`;
   }
-  if (state.pendingStart.kind === "java-architecture") {
-    return `
-      <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="javaTitle">
-        <h2 id="javaTitle">64-bit Java is required</h2>
-        <p>BlockHost found a 32-bit Java runtime. It cannot allocate enough memory for this server. Install 64-bit Java 21, then fully reopen BlockHost Manager.</p>
-        <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 21</a></div>
-      </section></div>`;
-  }
   return `
     <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="javaTitle">
       <h2 id="javaTitle">Java is required</h2>
       <p>Install 64-bit Java 21, then reopen BlockHost Manager.</p>
       <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 21</a></div>
+    </section></div>`;
+}
+
+function renderJavaSetupModal() {
+  const setup = state.javaSetup;
+  if (!setup?.required) return "";
+  const progress = setup.progress || {};
+  const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+  return `
+    <div class="overlay"><section class="modal compact dependency-modal" role="dialog" aria-modal="true" aria-labelledby="javaSetupTitle">
+      <p class="eyebrow">First-time setup</p>
+      <h2 id="javaSetupTitle">Java 21 is required</h2>
+      ${setup.installing ? `
+        <p>${escapeHtml(progress.message || "Preparing the Java runtime…")}</p>
+        <div class="transfer-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
+        <p class="muted">Keep BlockHost open while setup finishes.</p>
+      ` : `
+        <p>BlockHost can download the official 64-bit Eclipse Temurin runtime automatically. It stays inside BlockHost, needs no administrator access, and does not change your system Java.</p>
+        ${setup.error ? `<p class="inline-error">${escapeHtml(setup.error)}</p>` : ""}
+        <div class="modal-actions"><button class="secondary" id="skipJavaSetup" type="button">Not now</button><button class="primary" id="installJava" type="button">Download and set up Java</button></div>
+      `}
     </section></div>`;
 }
 
@@ -1416,7 +1427,7 @@ function render() {
   const scrollState = captureScrollState();
   root.innerHTML = `
     <div class="window-frame">${renderWindowTitlebar()}<div class="app-shell">${renderSidebar()}${selectedServer() ? renderServer() : renderEmpty()}</div></div>
-    ${renderCreateModal()}${renderServerSettingsModal()}${renderPropertiesModal()}${renderAddonsModal()}${renderStartModal()}${renderDeleteModal()}${renderTransferModal()}${renderDropOverlay()}${renderError()}<div id="notificationHost">${renderNotice()}</div>
+    ${renderCreateModal()}${renderServerSettingsModal()}${renderPropertiesModal()}${renderAddonsModal()}${renderStartModal()}${renderJavaSetupModal()}${renderDeleteModal()}${renderTransferModal()}${renderDropOverlay()}${renderError()}<div id="notificationHost">${renderNotice()}</div>
   `;
   bindEvents();
   updateLiveElements();
@@ -1549,7 +1560,7 @@ function bindEvents() {
   document.querySelectorAll(".overlay").forEach((overlay) => {
     overlay.addEventListener("click", (event) => {
       if (event.target !== overlay || state.transferPending) return;
-      const closeControl = overlay.querySelector(".modal-close:not(:disabled), #cancelProperties:not(:disabled), #closeProperties:not(:disabled), #closeAddons:not(:disabled), #closeAddonsBottom:not(:disabled), #cancelStart:not(:disabled), #cancelDelete:not(:disabled), #closeTransfer:not(:disabled)");
+      const closeControl = overlay.querySelector(".modal-close:not(:disabled), #cancelProperties:not(:disabled), #closeProperties:not(:disabled), #closeAddons:not(:disabled), #closeAddonsBottom:not(:disabled), #cancelStart:not(:disabled), #skipJavaSetup:not(:disabled), #cancelDelete:not(:disabled), #closeTransfer:not(:disabled)");
       if (closeControl) {
         closeControl.click();
         return;
@@ -1568,6 +1579,23 @@ function bindEvents() {
   document.getElementById("cancelStart")?.addEventListener("click", () => {
     state.pendingStart = null;
     render();
+  });
+  document.getElementById("skipJavaSetup")?.addEventListener("click", () => {
+    state.javaSetup = null;
+    render();
+  });
+  document.getElementById("installJava")?.addEventListener("click", async () => {
+    state.javaSetup = { ...state.javaSetup, installing: true, error: "" };
+    render();
+    try {
+      const status = await window.minecraftAPI.installJava();
+      if (!status?.ready) throw new Error(status?.reason || "Java setup did not complete");
+      state.javaSetup = null;
+      showNotice("Java 21 is ready. BlockHost can now run servers.");
+    } catch (error) {
+      state.javaSetup = { required: true, installing: false, progress: null, error: error.message || "Java setup failed" };
+      render();
+    }
   });
   document.getElementById("acceptEula")?.addEventListener("click", () => {
     state.pendingStart = null;
@@ -1741,6 +1769,12 @@ window.minecraftAPI.onOperationsChanged((operations) => {
   render();
 });
 
+window.minecraftAPI.onDependencyProgress((progress) => {
+  if (!state.javaSetup?.installing) return;
+  state.javaSetup.progress = progress;
+  render();
+});
+
 window.addEventListener("dragenter", (event) => {
   if (!event.dataTransfer?.types?.includes("Files") || state.transferPending) return;
   event.preventDefault();
@@ -1803,5 +1837,8 @@ render();
 Promise.all([
   loadServers(),
   window.minecraftAPI.getActiveOperations().then((operations) => { state.operations = operations; }),
+  window.minecraftAPI.getJavaStatus().then((status) => {
+    if (!status?.ready) state.javaSetup = { required: true, installing: false, progress: null, error: "", reason: status?.reason || "Java 21 is required" };
+  }),
 ]).then(render).catch(showError);
 setInterval(refreshLiveSafely, 2000);

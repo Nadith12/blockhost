@@ -9,6 +9,13 @@ contextBridge.exposeInMainWorld("minecraftAPI", {
     ipcRenderer.invoke("servers:getRuntimeState", serverId),
   getUsage: () => ipcRenderer.invoke("servers:getUsage"),
   getActiveOperations: () => ipcRenderer.invoke("operations:getActive"),
+  getJavaStatus: () => ipcRenderer.invoke("dependencies:getJavaStatus"),
+  installJava: () => ipcRenderer.invoke("dependencies:installJava"),
+  onDependencyProgress: (listener) => {
+    const handler = (_event, progress) => listener(progress);
+    ipcRenderer.on("dependencies:progress", handler);
+    return () => ipcRenderer.removeListener("dependencies:progress", handler);
+  },
   onOperationsChanged: (listener) => {
     const handler = (_event, operations) => listener(operations);
     ipcRenderer.on("operations:state", handler);

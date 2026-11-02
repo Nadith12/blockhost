@@ -10,6 +10,7 @@ test("Java runtime detection accepts 64-bit runtimes", () => {
   `);
   assert.equal(details.is64Bit, true);
   assert.equal(details.version, "21.0.5");
+  assert.equal(details.majorVersion, 21);
   assert.doesNotThrow(() => assertSupportedJavaRuntime(details));
 });
 
@@ -26,4 +27,9 @@ test("Java runtime detection rejects the 32-bit JVM that cannot allocate 4 GB", 
 test("Java runtime detection falls back to architecture when the data model is absent", () => {
   assert.equal(parseJavaRuntimeDetails("os.arch = aarch64").is64Bit, true);
   assert.equal(parseJavaRuntimeDetails("os.arch = i386").is64Bit, false);
+});
+
+test("Java runtime detection rejects versions older than Java 21", () => {
+  const details = parseJavaRuntimeDetails("java.version = 17.0.12\nos.arch = amd64\nsun.arch.data.model = 64");
+  assert.throws(() => assertSupportedJavaRuntime(details), /Java 21 or newer is required/);
 });

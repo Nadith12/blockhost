@@ -61,10 +61,11 @@ import {
 } from "./lib/external-importer.mjs";
 import { exportWorld, importWorld } from "./lib/world-manager.mjs";
 import { assertSupportedJavaRuntime, parseJavaRuntimeDetails } from "./lib/java-runtime.mjs";
+import { findJavaExecutable, installManagedJava, isManagedJavaReady } from "./lib/managed-java.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
-const APP_USER_AGENT = "BlockHostManager/1.0.0";
+const APP_USER_AGENT = "BlockHostManager/1.0.2";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
@@ -81,6 +82,7 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
 const runningServers = new Map();
 const recentExports = new Set();
 const approvedWorldSources = new Map();
+let javaInstallPromise = null;
 
 let mainWindow;
 let quitInProgress = false;
@@ -229,17 +231,59 @@ async function cachedDownload(type, version, info, fallbackName) {
   return { path: destination, usedCache: valid };
 }
 
-async function assertJavaInstalled() {
-  try {
-    const result = await execFileAsync("java", ["-XshowSettings:properties", "-version"], {
-      windowsHide: true,
-      maxBuffer: 1024 * 1024,
-    });
-    return assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`));
-  } catch (error) {
-    if (error.code === "ENOENT") throw new MissingJavaError();
-    throw error;
+function getManagedRuntimeRoot() {
+  return path.join(app.getPath("userData"), "runtime");
+}
+
+async function probeJava(command) {
+  const result = await execFileAsync(command, ["-XshowSettings:properties", "-version"], {
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
+  const details = assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`));
+  return { command, details };
+}
+
+async function getJavaRuntimeStatus() {
+  const managedHome = path.join(getManagedRuntimeRoot(), "java-21");
+  const managedCommand = isManagedJavaReady(managedHome) ? findJavaExecutable(managedHome, process.platform) : "";
+  if (managedCommand) {
+    try {
+      const runtime = await probeJava(managedCommand);
+      return { ready: true, source: "managed", autoInstallAvailable: true, ...runtime };
+    } catch {}
   }
+  try {
+    const runtime = await probeJava("java");
+    return { ready: true, source: "system", autoInstallAvailable: process.platform === "win32" && process.arch === "x64", ...runtime };
+  } catch (error) {
+    const reason = error.code === "ENOENT" ? new MissingJavaError().message : error.message;
+    return {
+      ready: false,
+      source: "none",
+      autoInstallAvailable: process.platform === "win32" && process.arch === "x64",
+      reason,
+    };
+  }
+}
+
+async function assertJavaInstalled() {
+  const status = await getJavaRuntimeStatus();
+  if (!status.ready) throw new Error(status.reason || new MissingJavaError().message);
+  return status;
+}
+
+async function installJavaDependency() {
+  if (process.platform !== "win32" || process.arch !== "x64") throw new Error("Automatic Java setup currently supports 64-bit Windows only");
+  if (javaInstallPromise) return javaInstallPromise;
+  javaInstallPromise = installManagedJava({
+    runtimeRoot: getManagedRuntimeRoot(),
+    validateJava: (command) => probeJava(command),
+    onProgress: (progress) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dependencies:progress", progress);
+    },
+  }).then(() => getJavaRuntimeStatus()).finally(() => { javaInstallPromise = null; });
+  return javaInstallPromise;
 }
 
 async function getVersionOptions(typeValue) {
@@ -383,7 +427,7 @@ async function createJarServer(data, type, info, loaderVersion = "") {
 }
 
 async function installLoaderServer(data, type, loaderVersion, installerUrl) {
-  await assertJavaInstalled();
+  const javaRuntime = await assertJavaInstalled();
   const id = Date.now();
   const name = normalizeServerName(data.name);
   const folder = createServerFolder(name, id);
@@ -393,7 +437,7 @@ async function installLoaderServer(data, type, loaderVersion, installerUrl) {
       url: installerUrl,
       fileName: installerName,
     }, installerName);
-    await execFileAsync("java", ["-jar", cached.path, "--installServer"], {
+    await execFileAsync(javaRuntime.command, ["-jar", cached.path, "--installServer"], {
       cwd: folder,
       windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
@@ -573,7 +617,7 @@ function updateServerMemory(id, input = {}) {
   return { ...memorySettings(server), appliesOnNextStart: Boolean(runningServers.get(server.id)?.process) };
 }
 
-function launchCommand(server) {
+function launchCommand(server, javaCommand = "java") {
   const memory = memorySettings(server);
   const common = [`-Dblockhost.serverId=${server.id}`, `-Xms${memory.minMemoryMb}M`, `-Xmx${memory.maxMemoryMb}M`];
   if (server.launchType === "javaArgsFile") {
@@ -581,12 +625,12 @@ function launchCommand(server) {
       ? server.launchArgsPath
       : path.join(server.folderPath, server.launchArgsPath);
     if (!fs.existsSync(absoluteArgs)) throw new Error("Server launch files are missing");
-    return ["java", [...common, `@${absoluteArgs}`, "nogui"]];
+    return [javaCommand, [...common, `@${absoluteArgs}`, "nogui"]];
   }
   if (!server.jarPath || !fs.existsSync(server.jarPath)) {
     throw new Error("Server JAR is missing; delete and download the server again");
   }
-  return ["java", [...common, "-jar", server.jarPath, "nogui"]];
+  return [javaCommand, [...common, "-jar", server.jarPath, "nogui"]];
 }
 
 async function startServer(id, options = {}) {
@@ -613,8 +657,8 @@ async function startServer(id, options = {}) {
     acceptEula(server);
   }
 
-  await assertJavaInstalled();
-  const [command, args] = launchCommand(server);
+  const javaRuntime = await assertJavaInstalled();
+  const [command, args] = launchCommand(server, javaRuntime.command);
   const runtime = {
     status: "starting",
     process: null,
@@ -1292,6 +1336,8 @@ app.on("before-quit", (event) => {
 ipcMain.handle("servers:getVersionOptions", (_event, options) =>
   getVersionOptions(options?.type)
 );
+ipcMain.handle("dependencies:getJavaStatus", () => getJavaRuntimeStatus());
+ipcMain.handle("dependencies:installJava", () => installJavaDependency());
 ipcMain.handle("servers:create", (_event, data) =>
   withServerOperation(-1, "downloading a server", () => createServer(data))
 );

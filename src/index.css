@@ -338,6 +338,9 @@ h2 { margin-bottom: 12px; font-size: 25px; letter-spacing: -.03em; }
 .transfer-modal > small { display: block; margin-top: 8px; color: #7f93ad; text-align: right; }
 .transfer-progress { height: 10px; overflow: hidden; background: #07111d; border: 1px solid #263c55; border-radius: 999px; }
 .transfer-progress span { display: block; height: 100%; background: linear-gradient(90deg, #2ca9ff, #54e0c1); border-radius: inherit; transition: width .18s ease; }
+.dependency-modal { max-width: 520px; }
+.dependency-modal .muted { margin: 12px 0 0; color: #7890a8; font-size: .82rem; }
+.dependency-modal .inline-error { margin: 14px 0 0; padding: 10px 12px; color: #ffb6bd; background: rgba(239, 82, 100, .1); border: 1px solid rgba(239, 82, 100, .3); border-radius: 10px; }
 .transfer-note { margin: 22px 0 0; padding: 11px 13px; background: #0b1827; border: 1px solid #243952; border-radius: 9px; font-size: 11px; }
 .drop-overlay { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 40px; background: rgba(4, 12, 22, .88); backdrop-filter: blur(10px); pointer-events: none; }
 .drop-overlay div { display: flex; flex-direction: column; align-items: center; justify-content: center; width: min(620px, 100%); min-height: 300px; border: 2px dashed #4fd4ff; border-radius: 22px; background: rgba(18, 42, 64, .65); box-shadow: inset 0 0 80px rgba(57, 201, 255, .06); }

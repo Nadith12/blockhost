@@ -17,19 +17,27 @@ export function parseJavaRuntimeDetails(output) {
   else if (/^(?:amd64|x86_64|aarch64|arm64|ppc64|s390x)$/.test(architecture)) is64Bit = true;
   else if (/^(?:x86|i[3-6]86|arm|arm32)$/.test(architecture)) is64Bit = false;
 
+  const version = String(versionMatch?.[1] || "").trim() || "unknown";
+  const versionParts = version.match(/^(?:1\.)?(\d+)/);
+  const majorVersion = versionParts ? Number(versionParts[1]) : null;
+
   return {
     architecture: architecture || "unknown",
     dataModel,
     is64Bit,
-    version: String(versionMatch?.[1] || "").trim() || "unknown",
+    version,
+    majorVersion,
   };
 }
 
-export function assertSupportedJavaRuntime(details) {
+export function assertSupportedJavaRuntime(details, minimumMajor = 21) {
   if (details?.is64Bit === false) {
     throw new Error(
       "64-bit Java is required. BlockHost found a 32-bit Java runtime, which cannot run servers with the selected RAM. Install 64-bit Java 21 and reopen BlockHost Manager."
     );
+  }
+  if (!Number.isSafeInteger(details?.majorVersion) || details.majorVersion < minimumMajor) {
+    throw new Error(`Java ${minimumMajor} or newer is required. BlockHost found Java ${details?.version || "of an unknown version"}.`);
   }
   return details;
 }
