@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assertSupportedJavaRuntime, parseJavaRuntimeDetails } from "../src/lib/java-runtime.mjs";
+import { assertSupportedJavaRuntime, parseJavaRuntimeDetails, requiredJavaVersion } from "../src/lib/java-runtime.mjs";
 
 test("Java runtime detection accepts 64-bit runtimes", () => {
   const details = parseJavaRuntimeDetails(`
@@ -21,7 +21,7 @@ test("Java runtime detection rejects the 32-bit JVM that cannot allocate 4 GB", 
     sun.arch.data.model = 32
   `);
   assert.equal(details.is64Bit, false);
-  assert.throws(() => assertSupportedJavaRuntime(details), /64-bit Java is required/);
+  assert.throws(() => assertSupportedJavaRuntime(details), /64-bit Java 21 is required/);
 });
 
 test("Java runtime detection falls back to architecture when the data model is absent", () => {
@@ -32,4 +32,11 @@ test("Java runtime detection falls back to architecture when the data model is a
 test("Java runtime detection rejects versions older than Java 21", () => {
   const details = parseJavaRuntimeDetails("java.version = 17.0.12\nos.arch = amd64\nsun.arch.data.model = 64");
   assert.throws(() => assertSupportedJavaRuntime(details), /Java 21 or newer is required/);
+});
+
+test("Minecraft 26.x selects Java 25 while earlier releases stay on Java 21", () => {
+  assert.equal(requiredJavaVersion("26.1"), 25);
+  assert.equal(requiredJavaVersion("26.3.0.101"), 25);
+  assert.equal(requiredJavaVersion("1.21.11"), 21);
+  assert.equal(requiredJavaVersion("1.20.6"), 21);
 });

@@ -9,7 +9,6 @@ import { assertPathInside } from "./safe-filesystem.mjs";
 const MAX_ARCHIVE_BYTES = 500 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 const MAX_ENTRIES = 50_000;
-const ASSETS_URL = "https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&heap_size=normal&image_type=jre&jvm_impl=hotspot&os=windows&page=0&page_size=1&project=jdk&release_type=ga&sort_method=DEFAULT&sort_order=DESC&vendor=eclipse";
 const DOWNLOAD_HOSTS = new Set(["github.com", "api.adoptium.net"]);
 const READY_MARKER = ".blockhost-java-ready";
 
@@ -111,9 +110,10 @@ export function isManagedJavaReady(rootPath) {
   return fs.existsSync(path.join(path.resolve(rootPath), READY_MARKER));
 }
 
-async function getPackageMetadata(fetchImpl) {
-  const response = await fetchImpl(ASSETS_URL, {
-    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.3" },
+async function getPackageMetadata(javaVersion, fetchImpl) {
+  const assetsUrl = `https://api.adoptium.net/v3/assets/latest/${javaVersion}/hotspot?architecture=x64&heap_size=normal&image_type=jre&jvm_impl=hotspot&os=windows&page=0&page_size=1&project=jdk&release_type=ga&sort_method=DEFAULT&sort_order=DESC&vendor=eclipse`;
+  const response = await fetchImpl(assetsUrl, {
+    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.4" },
   });
   if (!response.ok) throw new Error(`Java provider returned HTTP ${response.status}`);
   const assets = await response.json();
@@ -130,7 +130,7 @@ async function getPackageMetadata(fetchImpl) {
 }
 
 async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) {
-  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.3" } });
+  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.4" } });
   if (!response.ok || !response.body) throw new Error(`Java download failed with HTTP ${response.status}`);
   const hash = crypto.createHash("sha256");
   let received = 0;
@@ -150,15 +150,20 @@ async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) 
 }
 
 export async function installManagedJava(options) {
+  const javaVersion = Number(options.javaVersion || 25);
+  if (![21, 25].includes(javaVersion)) throw new Error("BlockHost cannot automatically install that Java version");
   const runtimeRoot = path.resolve(options.runtimeRoot);
-  const destination = assertPathInside(runtimeRoot, path.join(runtimeRoot, "java-21"));
+  const destination = assertPathInside(runtimeRoot, path.join(runtimeRoot, `java-${javaVersion}`));
   const archive = assertPathInside(runtimeRoot, path.join(runtimeRoot, `.java-download-${crypto.randomUUID()}.zip`));
   const fetchImpl = options.fetchImpl || fetch;
   fs.mkdirSync(runtimeRoot, { recursive: true });
   try {
-    emitProgress(options.onProgress, "metadata", 2, "Finding the official Java 21 package…");
-    const packageInfo = await getPackageMetadata(fetchImpl);
-    await downloadPackage(packageInfo, archive, fetchImpl, options.onProgress);
+    emitProgress(options.onProgress, "metadata", 2, `Finding the official Java ${javaVersion} package…`);
+    const packageInfo = await getPackageMetadata(javaVersion, fetchImpl);
+    await downloadPackage(packageInfo, archive, fetchImpl, (progress) => options.onProgress?.({
+      ...progress,
+      message: progress.stage === "download" ? progress.message.replace("Java 21", `Java ${javaVersion}`) : progress.message,
+    }));
     if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
     fs.mkdirSync(destination, { recursive: true });
     try {
@@ -167,9 +172,9 @@ export async function installManagedJava(options) {
       if (!executable) throw new Error("The downloaded package did not contain Java");
       emitProgress(options.onProgress, "validate", 95, "Checking the Java runtime…");
       const validation = await options.validateJava?.(executable);
-      fs.writeFileSync(path.join(destination, READY_MARKER), "BlockHost managed Java 21\n", { encoding: "utf8", flag: "wx" });
-      emitProgress(options.onProgress, "complete", 100, "Java 21 is ready.");
-      return { executable, destination, packageSize: packageInfo.size, details: validation?.details || null };
+      fs.writeFileSync(path.join(destination, READY_MARKER), `BlockHost managed Java ${javaVersion}\n`, { encoding: "utf8", flag: "wx" });
+      emitProgress(options.onProgress, "complete", 100, `Java ${javaVersion} is ready.`);
+      return { executable, destination, javaVersion, packageSize: packageInfo.size, details: validation?.details || null };
     } catch (error) {
       if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
       throw error;

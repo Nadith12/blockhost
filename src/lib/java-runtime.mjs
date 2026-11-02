@@ -33,11 +33,18 @@ export function parseJavaRuntimeDetails(output) {
 export function assertSupportedJavaRuntime(details, minimumMajor = 21) {
   if (details?.is64Bit === false) {
     throw new Error(
-      "64-bit Java is required. BlockHost found a 32-bit Java runtime, which cannot run servers with the selected RAM. Install 64-bit Java 21 and reopen BlockHost Manager."
+      `64-bit Java ${minimumMajor} is required. BlockHost found a 32-bit Java runtime, which cannot run servers with the selected RAM.`
     );
   }
   if (!Number.isSafeInteger(details?.majorVersion) || details.majorVersion < minimumMajor) {
     throw new Error(`Java ${minimumMajor} or newer is required. BlockHost found Java ${details?.version || "of an unknown version"}.`);
   }
   return details;
+}
+
+export function requiredJavaVersion(minecraftVersion) {
+  const value = String(minecraftVersion || "").trim();
+  const modern = value.match(/^(\d{2,})(?:\.|$)/);
+  if (modern && Number(modern[1]) >= 26) return 25;
+  return 21;
 }

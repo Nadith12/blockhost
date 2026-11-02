@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld("minecraftAPI", {
   getUsage: () => ipcRenderer.invoke("servers:getUsage"),
   getActiveOperations: () => ipcRenderer.invoke("operations:getActive"),
   getJavaStatus: () => ipcRenderer.invoke("dependencies:getJavaStatus"),
-  installJava: () => ipcRenderer.invoke("dependencies:installJava"),
+  installJava: (javaVersion) => ipcRenderer.invoke("dependencies:installJava", javaVersion),
   onDependencyProgress: (listener) => {
     const handler = (_event, progress) => listener(progress);
     ipcRenderer.on("dependencies:progress", handler);

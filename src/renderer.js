@@ -2,7 +2,7 @@ import "./index.css";
 import appIconUrl from "../assets/app-icon.png";
 
 const root = document.getElementById("app");
-const JAVA_URL = "https://adoptium.net/temurin/releases/?version=21&os=windows&arch=x64&package=jdk";
+const JAVA_URL = "https://adoptium.net/temurin/releases/?version=25&os=windows&arch=x64&package=jdk";
 const NOTICE_DURATION_MS = 4500;
 let noticeTimer = null;
 
@@ -287,7 +287,8 @@ async function startServer(options = {}) {
   } catch (error) {
     const message = error.message || "";
     if (/Java|JDK|JRE/i.test(message)) {
-      state.javaSetup = { required: true, installing: false, progress: null, error: "", reason: message };
+      const requiredVersion = Number(message.match(/Java\s+(\d+)/i)?.[1]) >= 25 ? 25 : 21;
+      state.javaSetup = { required: true, requiredVersion, installing: false, progress: null, error: "", reason: message };
       render();
     } else {
       showError(error);
@@ -1281,8 +1282,8 @@ function renderStartModal() {
   return `
     <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="javaTitle">
       <h2 id="javaTitle">Java is required</h2>
-      <p>Install 64-bit Java 21, then reopen BlockHost Manager.</p>
-      <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 21</a></div>
+      <p>Install 64-bit Java 25, then reopen BlockHost Manager.</p>
+      <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Close</button><a class="primary link-button" href="${JAVA_URL}" target="_blank" rel="noreferrer">Get 64-bit Java 25</a></div>
     </section></div>`;
 }
 
@@ -1290,17 +1291,18 @@ function renderJavaSetupModal() {
   const setup = state.javaSetup;
   if (!setup?.required) return "";
   const progress = setup.progress || {};
+  const javaVersion = Number(setup.requiredVersion) >= 25 ? 25 : 21;
   const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
   return `
     <div class="overlay"><section class="modal compact dependency-modal" role="dialog" aria-modal="true" aria-labelledby="javaSetupTitle">
       <p class="eyebrow">First-time setup</p>
-      <h2 id="javaSetupTitle">Java 21 is required</h2>
+      <h2 id="javaSetupTitle">Java ${javaVersion} is required</h2>
       ${setup.installing ? `
         <p>${escapeHtml(progress.message || "Preparing the Java runtime…")}</p>
         <div class="transfer-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>
         <p class="muted">Keep BlockHost open while setup finishes.</p>
       ` : `
-        <p>BlockHost can download the official 64-bit Eclipse Temurin runtime automatically. It stays inside BlockHost, needs no administrator access, and does not change your system Java.</p>
+        <p>BlockHost can download the official 64-bit Eclipse Temurin ${javaVersion} runtime automatically. It stays inside BlockHost, needs no administrator access, and does not change your system Java.</p>
         ${setup.error ? `<p class="inline-error">${escapeHtml(setup.error)}</p>` : ""}
         <div class="modal-actions"><button class="secondary" id="skipJavaSetup" type="button">Not now</button><button class="primary" id="installJava" type="button">Download and set up Java</button></div>
       `}
@@ -1585,15 +1587,16 @@ function bindEvents() {
     render();
   });
   document.getElementById("installJava")?.addEventListener("click", async () => {
+    const requestedJavaVersion = state.javaSetup?.requiredVersion || 25;
     state.javaSetup = { ...state.javaSetup, installing: true, error: "" };
     render();
     try {
-      const status = await window.minecraftAPI.installJava();
+      const status = await window.minecraftAPI.installJava(requestedJavaVersion);
       if (!status?.ready) throw new Error(status?.reason || "Java setup did not complete");
       state.javaSetup = null;
-      showNotice("Java 21 is ready. BlockHost can now run servers.");
+      showNotice(`Java ${status.requiredVersion || 25} is ready. BlockHost can now run servers.`);
     } catch (error) {
-      state.javaSetup = { required: true, installing: false, progress: null, error: error.message || "Java setup failed" };
+      state.javaSetup = { required: true, requiredVersion: requestedJavaVersion, installing: false, progress: null, error: error.message || "Java setup failed" };
       render();
     }
   });
@@ -1838,7 +1841,7 @@ Promise.all([
   loadServers(),
   window.minecraftAPI.getActiveOperations().then((operations) => { state.operations = operations; }),
   window.minecraftAPI.getJavaStatus().then((status) => {
-    if (!status?.ready) state.javaSetup = { required: true, installing: false, progress: null, error: "", reason: status?.reason || "Java 21 is required" };
+    if (!status?.ready) state.javaSetup = { required: true, requiredVersion: status?.requiredVersion || 25, installing: false, progress: null, error: "", reason: status?.reason || "Java 25 is required" };
   }),
 ]).then(render).catch(showError);
 setInterval(refreshLiveSafely, 2000);

@@ -42,6 +42,7 @@ test("managed Java installation verifies and activates an app-private runtime", 
   let validated = "";
   const result = await installManagedJava({
     runtimeRoot: root,
+    javaVersion: 21,
     fetchImpl,
     validateJava: async (executable) => { validated = executable; },
   });
@@ -81,7 +82,7 @@ test("managed Java installation rejects a bad published checksum without exposin
     }
     return new Response(archive, { status: 200 });
   };
-  await assert.rejects(() => installManagedJava({ runtimeRoot: root, fetchImpl }), /SHA-256 verification/);
+  await assert.rejects(() => installManagedJava({ runtimeRoot: root, javaVersion: 21, fetchImpl }), /SHA-256 verification/);
   assert.equal(findJavaExecutable(path.join(root, "java-21"), "win32"), "");
   assert.equal(isManagedJavaReady(path.join(root, "java-21")), false);
   assert.deepEqual(fs.readdirSync(root), []);

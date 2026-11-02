@@ -60,12 +60,12 @@ import {
   importExternalServer,
 } from "./lib/external-importer.mjs";
 import { exportWorld, importWorld } from "./lib/world-manager.mjs";
-import { assertSupportedJavaRuntime, parseJavaRuntimeDetails } from "./lib/java-runtime.mjs";
+import { assertSupportedJavaRuntime, parseJavaRuntimeDetails, requiredJavaVersion } from "./lib/java-runtime.mjs";
 import { cleanupManagedJavaArtifacts, findJavaExecutable, installManagedJava, isManagedJavaReady } from "./lib/managed-java.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
-const APP_USER_AGENT = "BlockHostManager/1.0.3";
+const APP_USER_AGENT = "BlockHostManager/1.0.4";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
@@ -235,52 +235,59 @@ function getManagedRuntimeRoot() {
   return path.join(app.getPath("userData"), "runtime");
 }
 
-async function probeJava(command) {
+async function probeJava(command, minimumMajor = 21) {
   const result = await execFileAsync(command, ["-XshowSettings:properties", "-version"], {
     windowsHide: true,
     maxBuffer: 1024 * 1024,
     timeout: 20_000,
   });
-  const details = assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`));
+  const details = assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`), minimumMajor);
   return { command, details };
 }
 
-async function getJavaRuntimeStatus() {
-  const managedHome = path.join(getManagedRuntimeRoot(), "java-21");
+async function getJavaRuntimeStatus(minimumMajor = 25) {
+  const requiredVersion = minimumMajor >= 25 ? 25 : 21;
+  const managedHome = path.join(getManagedRuntimeRoot(), `java-${requiredVersion}`);
   const managedCommand = isManagedJavaReady(managedHome) ? findJavaExecutable(managedHome, process.platform) : "";
   if (managedCommand) {
     try {
-      const runtime = await probeJava(managedCommand);
-      return { ready: true, source: "managed", autoInstallAvailable: true, ...runtime };
+      const runtime = await probeJava(managedCommand, requiredVersion);
+      return { ready: true, source: "managed", requiredVersion, autoInstallAvailable: true, ...runtime };
     } catch {}
   }
   try {
-    const runtime = await probeJava("java");
-    return { ready: true, source: "system", autoInstallAvailable: process.platform === "win32" && process.arch === "x64", ...runtime };
+    const runtime = await probeJava("java", requiredVersion);
+    return { ready: true, source: "system", requiredVersion, autoInstallAvailable: process.platform === "win32" && process.arch === "x64", ...runtime };
   } catch (error) {
-    const reason = error.code === "ENOENT" ? new MissingJavaError().message : error.message;
+    const reason = error.code === "ENOENT"
+      ? `Java ${requiredVersion} is required and no compatible Java runtime was found.`
+      : error.message;
     return {
       ready: false,
       source: "none",
+      requiredVersion,
       autoInstallAvailable: process.platform === "win32" && process.arch === "x64",
       reason,
     };
   }
 }
 
-async function assertJavaInstalled() {
-  const status = await getJavaRuntimeStatus();
+async function assertJavaInstalled(minecraftVersion) {
+  const minimumMajor = requiredJavaVersion(minecraftVersion);
+  const status = await getJavaRuntimeStatus(minimumMajor);
   if (!status.ready) throw new Error(status.reason || new MissingJavaError().message);
   return status;
 }
 
-async function installJavaDependency() {
+async function installJavaDependency(javaVersionValue = 25) {
   if (process.platform !== "win32" || process.arch !== "x64") throw new Error("Automatic Java setup currently supports 64-bit Windows only");
+  const javaVersion = Number(javaVersionValue) >= 25 ? 25 : 21;
   if (javaInstallPromise) return javaInstallPromise;
   let lastProgressKey = "";
   javaInstallPromise = installManagedJava({
     runtimeRoot: getManagedRuntimeRoot(),
-    validateJava: (command) => probeJava(command),
+    javaVersion,
+    validateJava: (command) => probeJava(command, javaVersion),
     onProgress: (progress) => {
       const progressKey = `${progress.stage}:${progress.percent}`;
       if (progressKey === lastProgressKey) return;
@@ -290,6 +297,7 @@ async function installJavaDependency() {
   }).then((result) => ({
     ready: true,
     source: "managed",
+    requiredVersion: javaVersion,
     autoInstallAvailable: true,
     command: result.executable,
     details: result.details,
@@ -374,6 +382,7 @@ function neoforgeMinecraftVersion(version) {
   if (!match) return "";
   if (Number(match[1]) === 20) return `1.20.${Number(match[2])}`;
   if (Number(match[1]) === 21) return `1.21.${Number(match[2])}`;
+  if (Number(match[1]) >= 26) return `${Number(match[1])}.${Number(match[2])}`;
   return "";
 }
 
@@ -438,7 +447,7 @@ async function createJarServer(data, type, info, loaderVersion = "") {
 }
 
 async function installLoaderServer(data, type, loaderVersion, installerUrl) {
-  const javaRuntime = await assertJavaInstalled();
+  const javaRuntime = await assertJavaInstalled(data.version);
   const id = Date.now();
   const name = normalizeServerName(data.name);
   const folder = createServerFolder(name, id);
@@ -668,7 +677,7 @@ async function startServer(id, options = {}) {
     acceptEula(server);
   }
 
-  const javaRuntime = await assertJavaInstalled();
+  const javaRuntime = await assertJavaInstalled(server.version);
   const [command, args] = launchCommand(server, javaRuntime.command);
   const runtime = {
     status: "starting",
@@ -1349,7 +1358,7 @@ ipcMain.handle("servers:getVersionOptions", (_event, options) =>
   getVersionOptions(options?.type)
 );
 ipcMain.handle("dependencies:getJavaStatus", () => getJavaRuntimeStatus());
-ipcMain.handle("dependencies:installJava", () => installJavaDependency());
+ipcMain.handle("dependencies:installJava", (_event, javaVersion) => installJavaDependency(javaVersion));
 ipcMain.handle("servers:create", (_event, data) =>
   withServerOperation(-1, "downloading a server", () => createServer(data))
 );
