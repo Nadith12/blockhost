@@ -61,11 +61,11 @@ import {
 } from "./lib/external-importer.mjs";
 import { exportWorld, importWorld } from "./lib/world-manager.mjs";
 import { assertSupportedJavaRuntime, parseJavaRuntimeDetails } from "./lib/java-runtime.mjs";
-import { findJavaExecutable, installManagedJava, isManagedJavaReady } from "./lib/managed-java.mjs";
+import { cleanupManagedJavaArtifacts, findJavaExecutable, installManagedJava, isManagedJavaReady } from "./lib/managed-java.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
-const APP_USER_AGENT = "BlockHostManager/1.0.2";
+const APP_USER_AGENT = "BlockHostManager/1.0.3";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
@@ -239,6 +239,7 @@ async function probeJava(command) {
   const result = await execFileAsync(command, ["-XshowSettings:properties", "-version"], {
     windowsHide: true,
     maxBuffer: 1024 * 1024,
+    timeout: 20_000,
   });
   const details = assertSupportedJavaRuntime(parseJavaRuntimeDetails(`${result.stdout || ""}\n${result.stderr || ""}`));
   return { command, details };
@@ -276,13 +277,23 @@ async function assertJavaInstalled() {
 async function installJavaDependency() {
   if (process.platform !== "win32" || process.arch !== "x64") throw new Error("Automatic Java setup currently supports 64-bit Windows only");
   if (javaInstallPromise) return javaInstallPromise;
+  let lastProgressKey = "";
   javaInstallPromise = installManagedJava({
     runtimeRoot: getManagedRuntimeRoot(),
     validateJava: (command) => probeJava(command),
     onProgress: (progress) => {
+      const progressKey = `${progress.stage}:${progress.percent}`;
+      if (progressKey === lastProgressKey) return;
+      lastProgressKey = progressKey;
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dependencies:progress", progress);
     },
-  }).then(() => getJavaRuntimeStatus()).finally(() => { javaInstallPromise = null; });
+  }).then((result) => ({
+    ready: true,
+    source: "managed",
+    autoInstallAvailable: true,
+    command: result.executable,
+    details: result.details,
+  })).finally(() => { javaInstallPromise = null; });
   return javaInstallPromise;
 }
 
@@ -1305,6 +1316,7 @@ app.whenReady().then(() => {
   cleanupAbandonedTransfers(getServersRoot(), getExportsDirectory());
   cleanupAbandonedAddonTransactions(getServersRoot());
   cleanupAbandonedExternalImports(getServersRoot());
+  cleanupManagedJavaArtifacts(getManagedRuntimeRoot()).catch(() => {});
   createWindow();
   subscribeOperations((operations) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("operations:state", operations);

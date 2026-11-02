@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import yazl from "yazl";
-import { findJavaExecutable, installManagedJava, isManagedJavaReady } from "../src/lib/managed-java.mjs";
+import { cleanupManagedJavaArtifacts, findJavaExecutable, installManagedJava, isManagedJavaReady } from "../src/lib/managed-java.mjs";
 
 function zipBuffer(entries) {
   return new Promise((resolve, reject) => {
@@ -46,11 +46,22 @@ test("managed Java installation verifies and activates an app-private runtime", 
     validateJava: async (executable) => { validated = executable; },
   });
   assert.equal(request, 2);
-  assert.equal(result.executable, path.join(root, "java-21", "bin", "java.exe"));
+  assert.equal(result.executable, path.join(root, "java-21", "jdk-21", "bin", "java.exe"));
   assert.equal(validated.endsWith(path.join("bin", "java.exe")), true);
   assert.equal(findJavaExecutable(path.join(root, "java-21"), "win32"), result.executable);
   assert.equal(isManagedJavaReady(path.join(root, "java-21")), true);
   assert.equal(fs.readFileSync(result.executable, "utf8"), "test-java");
+  assert.deepEqual(fs.readdirSync(root), ["java-21"]);
+});
+
+test("managed Java cleanup removes abandoned 1.0.2 staging data in the background", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "blockhost-java-cleanup-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, ".java-install-12345678-1234-1234-1234-123456789abc", "jdk", "bin"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".java-download-12345678-1234-1234-1234-123456789abc.zip"), "partial");
+  fs.mkdirSync(path.join(root, "java-21"), { recursive: true });
+  fs.writeFileSync(path.join(root, "java-21", ".blockhost-java-ready"), "ready");
+  await cleanupManagedJavaArtifacts(root);
   assert.deepEqual(fs.readdirSync(root), ["java-21"]);
 });
 

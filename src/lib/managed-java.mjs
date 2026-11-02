@@ -113,7 +113,7 @@ export function isManagedJavaReady(rootPath) {
 
 async function getPackageMetadata(fetchImpl) {
   const response = await fetchImpl(ASSETS_URL, {
-    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.2" },
+    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.3" },
   });
   if (!response.ok) throw new Error(`Java provider returned HTTP ${response.status}`);
   const assets = await response.json();
@@ -130,7 +130,7 @@ async function getPackageMetadata(fetchImpl) {
 }
 
 async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) {
-  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.2" } });
+  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.3" } });
   if (!response.ok || !response.body) throw new Error(`Java download failed with HTTP ${response.status}`);
   const hash = crypto.createHash("sha256");
   let received = 0;
@@ -152,7 +152,6 @@ async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) 
 export async function installManagedJava(options) {
   const runtimeRoot = path.resolve(options.runtimeRoot);
   const destination = assertPathInside(runtimeRoot, path.join(runtimeRoot, "java-21"));
-  const staging = assertPathInside(runtimeRoot, path.join(runtimeRoot, `.java-install-${crypto.randomUUID()}`));
   const archive = assertPathInside(runtimeRoot, path.join(runtimeRoot, `.java-download-${crypto.randomUUID()}.zip`));
   const fetchImpl = options.fetchImpl || fetch;
   fs.mkdirSync(runtimeRoot, { recursive: true });
@@ -160,25 +159,31 @@ export async function installManagedJava(options) {
     emitProgress(options.onProgress, "metadata", 2, "Finding the official Java 21 package…");
     const packageInfo = await getPackageMetadata(fetchImpl);
     await downloadPackage(packageInfo, archive, fetchImpl, options.onProgress);
-    fs.mkdirSync(staging, { recursive: true });
-    await extractRuntime(archive, staging, options.onProgress);
-    const stagedExecutable = findJavaExecutable(staging, "win32");
-    if (!stagedExecutable) throw new Error("The downloaded package did not contain Java");
-    await options.validateJava?.(stagedExecutable);
-    const javaHome = path.dirname(path.dirname(stagedExecutable));
     if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+    fs.mkdirSync(destination, { recursive: true });
     try {
-      fs.cpSync(javaHome, destination, { recursive: true, errorOnExist: true, force: false });
+      await extractRuntime(archive, destination, options.onProgress);
+      const executable = findJavaExecutable(destination, "win32");
+      if (!executable) throw new Error("The downloaded package did not contain Java");
+      emitProgress(options.onProgress, "validate", 95, "Checking the Java runtime…");
+      const validation = await options.validateJava?.(executable);
       fs.writeFileSync(path.join(destination, READY_MARKER), "BlockHost managed Java 21\n", { encoding: "utf8", flag: "wx" });
+      emitProgress(options.onProgress, "complete", 100, "Java 21 is ready.");
+      return { executable, destination, packageSize: packageInfo.size, details: validation?.details || null };
     } catch (error) {
       if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
       throw error;
     }
-    const executable = findJavaExecutable(destination, "win32");
-    emitProgress(options.onProgress, "complete", 100, "Java 21 is ready.");
-    return { executable, destination, packageSize: packageInfo.size };
   } finally {
     if (fs.existsSync(archive)) fs.rmSync(archive, { force: true });
-    if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
   }
+}
+
+export async function cleanupManagedJavaArtifacts(runtimeRoot) {
+  const root = path.resolve(runtimeRoot);
+  if (!fs.existsSync(root)) return;
+  const abandoned = fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => /^\.java-(?:install|download)-[0-9a-f-]+(?:\.zip)?$/i.test(entry.name))
+    .map((entry) => assertPathInside(root, path.join(root, entry.name)));
+  await Promise.allSettled(abandoned.map((candidate) => fs.promises.rm(candidate, { recursive: true, force: true })));
 }
