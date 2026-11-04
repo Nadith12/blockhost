@@ -27,6 +27,12 @@ contextBridge.exposeInMainWorld("minecraftAPI", {
     ipcRenderer.invoke("servers:stop", serverId),
   sendCommand: (serverId, command) =>
     ipcRenderer.invoke("servers:sendCommand", { id: serverId, command }),
+  copyText: (value) => ipcRenderer.invoke("app:copyText", value),
+  onConsoleEntry: (listener) => {
+    const handler = (_event, payload) => listener(payload);
+    ipcRenderer.on("servers:consoleEntry", handler);
+    return () => ipcRenderer.removeListener("servers:consoleEntry", handler);
+  },
   deleteServer: (serverId) => ipcRenderer.invoke("servers:delete", serverId),
   getServerProperties: (serverId) =>
     ipcRenderer.invoke("servers:getProperties", serverId),
@@ -48,12 +54,14 @@ contextBridge.exposeInMainWorld("minecraftAPI", {
   exportWorld: (serverId) => ipcRenderer.invoke("worlds:export", serverId),
   getAddons: (serverId) => ipcRenderer.invoke("addons:list", serverId),
   getAddonRecommendations: (serverId) => ipcRenderer.invoke("addons:recommendations", serverId),
-  searchAddons: (serverId, query) =>
-    ipcRenderer.invoke("addons:search", { id: serverId, query }),
+  searchAddons: (serverId, query, options = {}) =>
+    ipcRenderer.invoke("addons:search", { id: serverId, query, category: options.category, sort: options.sort }),
+  openAddonProject: (projectId) => ipcRenderer.invoke("addons:openProject", projectId),
   installAddon: (serverId, project) =>
     ipcRenderer.invoke("addons:install", {
       id: serverId,
       projectId: project.projectId,
+      versionId: project.versionId,
       title: project.title,
       iconUrl: project.iconUrl,
     }),

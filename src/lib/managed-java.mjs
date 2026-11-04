@@ -113,7 +113,7 @@ export function isManagedJavaReady(rootPath) {
 async function getPackageMetadata(javaVersion, fetchImpl) {
   const assetsUrl = `https://api.adoptium.net/v3/assets/latest/${javaVersion}/hotspot?architecture=x64&heap_size=normal&image_type=jre&jvm_impl=hotspot&os=windows&page=0&page_size=1&project=jdk&release_type=ga&sort_method=DEFAULT&sort_order=DESC&vendor=eclipse`;
   const response = await fetchImpl(assetsUrl, {
-    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.5" },
+    headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.6" },
   });
   if (!response.ok) throw new Error(`Java provider returned HTTP ${response.status}`);
   const assets = await response.json();
@@ -130,7 +130,7 @@ async function getPackageMetadata(javaVersion, fetchImpl) {
 }
 
 async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) {
-  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.5" } });
+  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.6" } });
   if (!response.ok || !response.body) throw new Error(`Java download failed with HTTP ${response.status}`);
   const hash = crypto.createHash("sha256");
   let received = 0;

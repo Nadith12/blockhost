@@ -8,12 +8,21 @@ import { atomicWriteFile, assertPathInside } from "./safe-filesystem.mjs";
 
 const MODRINTH_API = "https://api.modrinth.com/v2";
 const MODRINTH_DOWNLOAD_HOST = "cdn.modrinth.com";
-const USER_AGENT = "nadithjayawardana1/BlockHost-Manager/1.0.0";
+const USER_AGENT = "nadithjayawardana1/BlockHost-Manager/1.0.6";
 const MAX_ADDON_BYTES = 512 * 1024 * 1024;
 const MAX_INSTALL_BYTES = 2 * 1024 * 1024 * 1024;
 const LOCK_VERSION = 2;
 const ADDON_HISTORY_DIRECTORY = ".blockhost-addon-history";
 const VALID_RELEASE_CHANNELS = new Set(["stable", "beta", "alpha"]);
+const ADDON_SORTS = new Set(["relevance", "downloads", "updated", "newest"]);
+const ADDON_CATEGORY_FACETS = new Map([
+  ["performance", ["categories:optimization"]],
+  ["administration", ["categories:management", "categories:utility"]],
+  ["world", ["categories:worldgen", "categories:adventure"]],
+  ["social", ["categories:social"]],
+  ["gameplay", ["categories:game-mechanics", "categories:minigame"]],
+  ["libraries", ["categories:library"]],
+]);
 
 function readJson(filePath, fallback) {
   try {
@@ -382,7 +391,7 @@ function normalizeModrinthIconUrl(value) {
   }
 }
 
-async function findCompatibleAddons(server, query, fetchImpl, { recommendations = false } = {}) {
+async function findCompatibleAddons(server, query, fetchImpl, { recommendations = false, category = "all", sort = "relevance" } = {}) {
   const profile = getAddonProfile(server);
   if (!profile.supported) return { ...profile, query: "", results: [] };
   const search = String(query || "").trim().slice(0, 100);
@@ -393,18 +402,58 @@ async function findCompatibleAddons(server, query, fetchImpl, { recommendations 
     [`versions:${server.version}`],
     recommendations ? recommendedServerEnvironmentFacets() : serverEnvironmentFacets(),
   ];
+  const categoryFacets = ADDON_CATEGORY_FACETS.get(String(category));
+  if (categoryFacets) facets.push(categoryFacets);
+  const requestedSort = ADDON_SORTS.has(sort) ? sort : "relevance";
+  const index = recommendations ? "downloads" : (!search && requestedSort === "relevance" ? "downloads" : requestedSort);
   const params = new URLSearchParams({
     facets: JSON.stringify(facets),
-    index: "downloads",
+    index,
     limit: recommendations ? "16" : "20",
   });
   if (search) params.set("query", search);
   const data = await modrinthJson(`/search?${params}`, {}, fetchImpl);
+  const hits = data.hits || [];
+  let verifiedVersions = new Map();
+  if (recommendations && hits.length) {
+    const releaseChannel = loadLock(server).preferences.releaseChannel;
+    const pending = [...hits];
+    const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
+      const verified = [];
+      while (pending.length) {
+        const hit = pending.shift();
+        try {
+          const version = await projectVersion(hit.project_id, server, profile, fetchImpl, releaseChannel, { optional: true });
+          if (version) {
+            await resolveInstallSet(server, {
+              projectId: String(hit.project_id),
+              title: String(hit.title || hit.slug || "Recommended add-on"),
+              versionId: String(version.id),
+              verifiedVersion: version,
+            }, fetchImpl);
+            verified.push([String(hit.project_id), version]);
+          }
+        } catch (error) {
+          verified.push([String(hit.project_id), { preflightError: error }]);
+        }
+      }
+      return verified;
+    });
+    const checked = (await Promise.all(workers)).flat();
+    const failures = checked.filter(([, version]) => version?.preflightError);
+    const compatible = checked.filter(([, version]) => version && !version.preflightError);
+    if (!compatible.length && failures.length === hits.length) throw failures[0][1].preflightError;
+    verifiedVersions = new Map(compatible);
+  }
   return {
     ...profile,
     query: search,
-    results: (data.hits || []).map((hit) => ({
+    category: categoryFacets ? String(category) : "all",
+    sort: index,
+    results: hits.filter((hit) => !recommendations || verifiedVersions.has(String(hit.project_id))).map((hit) => ({
       projectId: String(hit.project_id),
+      versionId: String(verifiedVersions.get(String(hit.project_id))?.id || ""),
+      versionNumber: String(verifiedVersions.get(String(hit.project_id))?.version_number || ""),
       title: String(hit.title || hit.slug || "Unnamed add-on"),
       description: String(hit.description || ""),
       author: String(hit.author || ""),
@@ -414,8 +463,10 @@ async function findCompatibleAddons(server, query, fetchImpl, { recommendations 
   };
 }
 
-export function searchCompatibleAddons(server, query, fetchImpl = fetch) {
-  return findCompatibleAddons(server, query, fetchImpl);
+export function searchCompatibleAddons(server, query, optionsOrFetch = {}, fetchImpl = fetch) {
+  const options = typeof optionsOrFetch === "function" ? {} : optionsOrFetch;
+  const requester = typeof optionsOrFetch === "function" ? optionsOrFetch : fetchImpl;
+  return findCompatibleAddons(server, query, requester, options);
 }
 
 export function recommendCompatibleAddons(server, fetchImpl = fetch) {
@@ -442,7 +493,7 @@ function chooseVersion(versions, server, profile, releaseChannel = "stable") {
   return null;
 }
 
-async function projectVersion(projectId, server, profile, fetchImpl, releaseChannel = loadLock(server).preferences.releaseChannel) {
+async function projectVersion(projectId, server, profile, fetchImpl, releaseChannel = loadLock(server).preferences.releaseChannel, options = {}) {
   const params = new URLSearchParams({
     loaders: JSON.stringify([profile.loader]),
     game_versions: JSON.stringify([String(server.version)]),
@@ -450,6 +501,7 @@ async function projectVersion(projectId, server, profile, fetchImpl, releaseChan
   });
   const versions = await modrinthJson(`/project/${encodeURIComponent(projectId)}/version?${params}`, {}, fetchImpl);
   const version = chooseVersion(versions, server, profile, releaseChannel);
+  if (!version && options.optional) return null;
   if (!version) throw new Error(`No compatible ${releaseChannel} ${profile.singular} release is available for Minecraft ${server.version}`);
   return version;
 }
@@ -519,7 +571,18 @@ async function resolveInstallSet(server, requested, fetchImpl) {
     });
   }
 
-  const rootVersion = await projectVersion(requested.projectId, server, profile, fetchImpl);
+  const releaseChannel = installed.preferences.releaseChannel;
+  let rootVersion;
+  if (requested.verifiedVersion) {
+    rootVersion = requested.verifiedVersion;
+  } else if (requested.versionId) {
+    rootVersion = await modrinthJson(`/version/${encodeURIComponent(requested.versionId)}`, {}, fetchImpl);
+    if (!compatibleVersion(rootVersion, server, profile) || !chooseVersion([rootVersion], server, profile, releaseChannel)) {
+      throw new Error(`The recommended ${profile.singular} release is no longer compatible with ${profile.loader} on Minecraft ${server.version}`);
+    }
+  } else {
+    rootVersion = await projectVersion(requested.projectId, server, profile, fetchImpl, releaseChannel);
+  }
   await resolveVersion(rootVersion, String(requested.title || "Selected add-on"));
   const totalSize = resolved.reduce((sum, item) => sum + item.file.size, 0);
   if (totalSize > MAX_INSTALL_BYTES) throw new Error("The selected add-on and its dependencies exceed the 2 GB installation limit");

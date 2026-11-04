@@ -108,16 +108,47 @@ test("search uses exact loader, game version, server environment, and identifyin
   }
 });
 
+test("browse supports purpose categories and sorting without requiring a query", async () => {
+  const { server, cleanup } = fixture("fabric");
+  try {
+    let requested;
+    const result = await searchCompatibleAddons(server, "", { category: "performance", sort: "updated" }, async (url) => {
+      requested = new URL(url);
+      return jsonResponse({ hits: [] });
+    });
+    const facets = JSON.parse(requested.searchParams.get("facets"));
+    assert.ok(facets.some((group) => group.includes("categories:optimization")));
+    assert.equal(requested.searchParams.has("query"), false);
+    assert.equal(requested.searchParams.get("index"), "updated");
+    assert.equal(result.category, "performance");
+    assert.equal(result.sort, "updated");
+  } finally {
+    cleanup();
+  }
+});
+
 test("recommendations use server-only download rankings without a search query", async () => {
   const { server, cleanup } = fixture("fabric");
   try {
     let requested;
+    const stableJar = jarBuffer("stable");
+    const safeVersion = version({ id: "safe-release", projectId: "safe", fileName: "safe.jar", buffer: stableJar });
+    const unsafeVersion = version({ id: "unsafe-release", projectId: "unsafe", fileName: "unsafe.jar", buffer: stableJar });
+    const betaVersion = { ...version({ id: "beta-release", projectId: "beta-only", fileName: "beta.jar", buffer: stableJar }), version_type: "beta" };
     const result = await recommendCompatibleAddons(server, async (url) => {
-      requested = new URL(url);
-      return jsonResponse({ hits: [
-        { project_id: "safe", title: "Recommended", downloads: 9000, icon_url: "https://cdn.modrinth.com/data/safe/icon.png" },
-        { project_id: "unsafe", title: "Unsafe icon", downloads: 8000, icon_url: "https://example.com/icon.png" },
-      ] });
+      const requestedUrl = new URL(url);
+      if (requestedUrl.pathname.endsWith("/search")) {
+        requested = requestedUrl;
+        return jsonResponse({ hits: [
+          { project_id: "safe", title: "Recommended", downloads: 9000, icon_url: "https://cdn.modrinth.com/data/safe/icon.png" },
+          { project_id: "unsafe", title: "Unsafe icon", downloads: 8000, icon_url: "https://example.com/icon.png" },
+          { project_id: "beta-only", title: "Beta only", downloads: 7000, icon_url: "" },
+        ] });
+      }
+      if (requestedUrl.pathname.includes("/project/safe/version")) return jsonResponse([safeVersion]);
+      if (requestedUrl.pathname.includes("/project/unsafe/version")) return jsonResponse([unsafeVersion]);
+      if (requestedUrl.pathname.includes("/project/beta-only/version")) return jsonResponse([betaVersion]);
+      throw new Error(`Unexpected URL ${url}`);
     });
     assert.equal(requested.searchParams.has("query"), false);
     assert.equal(requested.searchParams.get("index"), "downloads");
@@ -130,6 +161,8 @@ test("recommendations use server-only download rankings without a search query",
     ]);
     assert.equal(result.results[0].iconUrl, "https://cdn.modrinth.com/data/safe/icon.png");
     assert.equal(result.results[1].iconUrl, "");
+    assert.equal(result.results[0].versionId, "safe-release");
+    assert.equal(result.results.some((item) => item.projectId === "beta-only"), false);
   } finally {
     cleanup();
   }
@@ -183,6 +216,28 @@ test("Modrinth installation resolves required dependencies, verifies hashes, and
     rollbackAddonTransaction(result.transaction);
     assert.equal(fs.existsSync(path.join(folderPath, "mods", "root.jar")), false);
     assert.equal(fs.existsSync(path.join(folderPath, "addons-lock.json")), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("a preflighted recommendation installs the exact verified release", async () => {
+  const { server, folderPath, cleanup } = fixture("fabric");
+  const rootJar = jarBuffer("recommended");
+  const rootVersion = version({ id: "recommended-version", projectId: "recommended-project", fileName: "recommended.jar", buffer: rootJar });
+  try {
+    const result = await installModrinthAddon(server, {
+      projectId: "recommended-project",
+      versionId: "recommended-version",
+      title: "Recommended Mod",
+    }, async (url) => {
+      const value = String(url);
+      if (value.endsWith("/version/recommended-version")) return jsonResponse(rootVersion);
+      if (value.endsWith("/recommended.jar")) return fileResponse(rootJar);
+      throw new Error(`Unexpected URL ${value}`);
+    });
+    assert.equal(result.installed, 1);
+    assert.equal(fs.existsSync(path.join(folderPath, "mods", "recommended.jar")), true);
   } finally {
     cleanup();
   }

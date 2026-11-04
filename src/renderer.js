@@ -1,10 +1,14 @@
 import "./index.css";
 import appIconUrl from "../assets/app-icon.png";
+import { buildCommand, commandDefinition, normalizeRawCommand, searchCommands } from "./lib/command-catalog.mjs";
+import { attachErrorGroup, parseConsoleLine } from "./lib/console-log.mjs";
 
 const root = document.getElementById("app");
 const JAVA_URL = "https://adoptium.net/temurin/releases/?version=25&os=windows&arch=x64&package=jdk";
 const NOTICE_DURATION_MS = 4500;
 let noticeTimer = null;
+let addonSearchRequestSequence = 0;
+const legacyConsoleTimes = new Map();
 
 const state = {
   servers: [],
@@ -48,7 +52,11 @@ const state = {
   addonsPending: "",
   addonsModel: null,
   addonQuery: "",
+  addonCategory: "all",
+  addonSort: "relevance",
+  addonInstalledFilter: "all",
   addonResults: [],
+  addonHasSearched: false,
   addonSearching: false,
   addonError: "",
   addonSearchStatus: "",
@@ -63,6 +71,18 @@ const state = {
   error: "",
   errorRetry: null,
   notice: "",
+  consoleFilter: "all",
+  consoleSearch: "",
+  consoleClearedBeforeId: 0,
+  consoleAutoScroll: true,
+  commandAssistantOpen: false,
+  commandSearch: "",
+  selectedCommandId: "",
+  commandValues: {},
+  commandError: "",
+  commandConfirming: false,
+  commandHistory: [],
+  commandHistoryIndex: -1,
 };
 
 function escapeHtml(value) {
@@ -96,6 +116,246 @@ function statusLabel(status) {
     running: "Running",
     stopping: "Stopping",
   }[status] || "Offline";
+}
+
+function formatRunDuration(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor((Number(milliseconds) || 0) / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function runMetrics(runtime = {}) {
+  const active = ["starting", "running", "stopping"].includes(runtime.status);
+  const started = Date.parse(runtime.startedAt);
+  const uptimeMs = active && Number.isFinite(started) ? Math.max(0, Date.now() - started) : null;
+  const lastStarted = Date.parse(runtime.lastStartedAt);
+  return {
+    uptime: uptimeMs === null ? "—" : formatRunDuration(uptimeMs),
+    uptimeDetail: uptimeMs === null ? "Server is offline" : `Started ${new Date(started).toLocaleString()}`,
+    lastRun: Number.isFinite(lastStarted)
+      ? new Date(lastStarted).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : "—",
+    lastRunDetail: Number.isFinite(lastStarted)
+      ? new Date(lastStarted).toLocaleDateString()
+      : "Never started",
+    lastRunTitle: Number.isFinite(lastStarted) ? new Date(lastStarted).toLocaleString() : "",
+  };
+}
+
+function normalizedConsoleEntry(value, index = 0, previousOccurrence = "") {
+  const structured = value && typeof value === "object";
+  const raw = String(structured ? value.raw ?? value.message ?? "" : value || "");
+  const parsed = parseConsoleLine(raw, {
+    id: structured ? value.id : index + 1,
+    receivedAt: structured ? value.receivedAt : new Date().toISOString(),
+    source: structured ? value.source : "server",
+  });
+  if (!structured) {
+    const cacheKey = `${state.selectedId}:${index}:${raw}`;
+    if (parsed.minecraftTime) {
+      parsed.receivedAt = parsed.occurredAt;
+      legacyConsoleTimes.set(cacheKey, parsed.occurredAt);
+    } else {
+      const stableTime = legacyConsoleTimes.get(cacheKey) || previousOccurrence || parsed.receivedAt;
+      parsed.receivedAt = stableTime;
+      parsed.occurredAt = stableTime;
+      legacyConsoleTimes.set(cacheKey, stableTime);
+    }
+  }
+  return structured
+    ? { ...value, ...parsed, id: value.id, receivedAt: value.receivedAt || parsed.receivedAt }
+    : parsed;
+}
+
+function consoleEntries() {
+  const grouping = {};
+  const normalized = [];
+  for (const [index, value] of (state.runtime?.logs || []).entries()) {
+    const entry = normalizedConsoleEntry(value, index, normalized.at(-1)?.occurredAt || "");
+    normalized.push(attachErrorGroup({ ...entry, errorGroupId: "" }, grouping));
+  }
+  return normalized.filter((entry) => Number(entry.id || 0) > state.consoleClearedBeforeId);
+}
+
+function visibleConsoleEntries() {
+  const query = state.consoleSearch.trim().toLowerCase();
+  return consoleEntries().filter((entry) => {
+    const filterMatches = state.consoleFilter === "all"
+      || (state.consoleFilter === "players" && entry.category === "player")
+      || (state.consoleFilter === "warnings" && entry.level === "warn")
+      || (state.consoleFilter === "errors" && entry.level === "error");
+    if (!filterMatches) return false;
+    return !query || `${entry.raw} ${entry.message} ${entry.playerName}`.toLowerCase().includes(query);
+  });
+}
+
+function formatConsoleTimestamp(value) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+  const date = new Date(timestamp);
+  const day = date.toLocaleDateString([], { day: "2-digit", month: "short" });
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return `${day} ${time}`;
+}
+
+function renderConsoleMessage(entry) {
+  const message = String(entry.message ?? entry.raw ?? "");
+  const player = String(entry.playerName || "");
+  if (!player) return escapeHtml(message);
+  const index = message.indexOf(player);
+  if (index < 0) return escapeHtml(message);
+  return `${escapeHtml(message.slice(0, index))}<strong class="console-player-name">${escapeHtml(player)}</strong>${escapeHtml(message.slice(index + player.length))}`;
+}
+
+function renderConsoleRow(entry) {
+  const classes = ["console-line", `console-${escapeHtml(entry.level || "info")}`];
+  if (entry.event) classes.push(`console-${escapeHtml(entry.event)}`);
+  const label = entry.level === "command" ? "YOU" : entry.level === "app" ? "APP" : entry.level === "warn" ? "WARN" : "";
+  return `<div class="${classes.join(" ")}" data-log-id="${Number(entry.id) || 0}">
+    <time datetime="${escapeHtml(entry.occurredAt || entry.receivedAt || "")}" title="${escapeHtml(new Date(entry.occurredAt || entry.receivedAt || Date.now()).toLocaleString())}">${escapeHtml(formatConsoleTimestamp(entry.occurredAt || entry.receivedAt))}</time>
+    ${label ? `<span class="console-source">${label}</span>` : "<span class=\"console-source\" aria-hidden=\"true\"></span>"}
+    <code>${renderConsoleMessage(entry)}</code>
+  </div>`;
+}
+
+function renderErrorGroup(entries) {
+  const groupId = entries[0]?.errorGroupId || `single-${entries[0]?.id}`;
+  return `<article class="console-error-group" data-error-group="${escapeHtml(groupId)}">
+    <header><span>Error detected</span><div><button type="button" data-copy-error="${escapeHtml(groupId)}">Copy error</button><button type="button" data-copy-diagnostics="${escapeHtml(groupId)}">Copy diagnostics</button></div></header>
+    ${entries.map(renderConsoleRow).join("")}
+  </article>`;
+}
+
+function renderConsoleRows() {
+  const entries = visibleConsoleEntries();
+  if (!entries.length) {
+    const filtered = state.consoleFilter !== "all" || state.consoleSearch;
+    return `<div class="console-empty">${filtered ? "No console entries match this view." : "Server output will appear here."}</div>`;
+  }
+  const output = [];
+  for (let index = 0; index < entries.length;) {
+    const entry = entries[index];
+    if (entry.errorGroupId) {
+      const group = [];
+      while (index < entries.length && entries[index].errorGroupId === entry.errorGroupId) group.push(entries[index++]);
+      output.push(renderErrorGroup(group));
+    } else {
+      output.push(renderConsoleRow(entry));
+      index += 1;
+    }
+  }
+  return output.join("");
+}
+
+function consoleErrorCount() {
+  return new Set(consoleEntries().filter((entry) => entry.level === "error").map((entry) => entry.errorGroupId || `entry-${entry.id}`)).size;
+}
+
+function syncConsoleOutput() {
+  const output = document.getElementById("consoleOutput");
+  if (!output) return;
+  const wasAtBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
+  output.innerHTML = renderConsoleRows();
+  const count = document.getElementById("consoleErrorCount");
+  if (count) {
+    const errors = consoleErrorCount();
+    count.textContent = errors ? String(errors) : "";
+    count.hidden = !errors;
+  }
+  if (state.consoleAutoScroll) output.scrollTop = output.scrollHeight;
+  const latest = document.getElementById("jumpConsoleLatest");
+  if (latest) latest.hidden = state.consoleAutoScroll || wasAtBottom;
+}
+
+function errorGroupEntries(groupId) {
+  return consoleEntries().filter((entry) => (entry.errorGroupId || `single-${entry.id}`) === groupId);
+}
+
+async function writeClipboard(text, notice = "Copied to clipboard.") {
+  try {
+    try {
+      await window.minecraftAPI.copyText(text);
+    } catch (error) {
+      if (!/No handler registered for ['"]?app:copyText/i.test(error?.message || "")) throw error;
+      if (!navigator.clipboard?.writeText) throw new Error("Restart BlockHost once to activate clipboard support");
+      await navigator.clipboard.writeText(text);
+    }
+    showNotice(notice);
+  } catch (error) {
+    showError(error);
+  }
+}
+
+function consoleCopyLabel() {
+  return {
+    all: "Copy all",
+    players: "Copy players",
+    warnings: "Copy warnings",
+    errors: "Copy errors",
+  }[state.consoleFilter] || "Copy current view";
+}
+
+function diagnosticText(entries) {
+  const server = selectedServer();
+  const context = consoleEntries();
+  const firstIndex = context.findIndex((entry) => entry.id === entries[0]?.id);
+  const surrounding = context.slice(Math.max(0, firstIndex - 8), Math.min(context.length, firstIndex + entries.length + 8));
+  return [
+    "BlockHost console diagnostic",
+    `Server: ${server?.name || "Unknown"}`,
+    `Type: ${server?.typeLabel || server?.type || "Unknown"}`,
+    `Minecraft: ${server?.version || "Unknown"}`,
+    `Status: ${state.runtime?.status || "offline"}`,
+    "",
+    "Relevant console output:",
+    ...surrounding.map((entry) => entry.raw),
+  ].join("\n").replace(/C:\\Users\\[^\\\s]+/gi, "C:\\Users\\<user>");
+}
+
+function selectedCommand() {
+  return commandDefinition(state.selectedCommandId);
+}
+
+function currentCommandPreview() {
+  if (!state.selectedCommandId) return "";
+  try { return buildCommand(state.selectedCommandId, state.commandValues); } catch { return selectedCommand()?.syntax || ""; }
+}
+
+function renderCommandField(field) {
+  const value = state.commandValues[field.name] ?? field.default ?? "";
+  const playerOptions = state.runtime?.onlinePlayers || [];
+  if (field.type === "select") {
+    return `<label><span>${escapeHtml(field.label)}</span><select data-command-field="${escapeHtml(field.name)}"><option value="">Choose…</option>${field.options.map((option) => `<option value="${escapeHtml(option)}" ${value === option ? "selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select></label>`;
+  }
+  const listId = field.type === "player" ? `players-${escapeHtml(field.name)}` : "";
+  return `<label><span>${escapeHtml(field.label)}${field.required ? "" : " (optional)"}</span><input data-command-field="${escapeHtml(field.name)}" type="${field.type === "number" ? "number" : "text"}" value="${escapeHtml(value)}" placeholder="${escapeHtml(field.placeholder || "")}" ${field.min !== undefined ? `min="${field.min}"` : ""} ${field.max !== undefined ? `max="${field.max}"` : ""} ${listId ? `list="${listId}"` : ""} />${listId ? `<datalist id="${listId}">${playerOptions.map((player) => `<option value="${escapeHtml(player)}"></option>`).join("")}</datalist>` : ""}</label>`;
+}
+
+function renderCommandAssistant() {
+  if (!state.commandAssistantOpen) return "";
+  const definition = selectedCommand();
+  if (definition) {
+    return `<section class="command-builder" aria-label="Command builder">
+      <header><div><small>${escapeHtml(definition.category)}</small><strong>${escapeHtml(definition.name)}</strong><p>${escapeHtml(definition.description)}</p></div><button id="closeCommandAssistant" type="button" aria-label="Close command builder">×</button></header>
+      ${definition.fields.length ? `<div class="command-fields">${definition.fields.map(renderCommandField).join("")}</div>` : ""}
+      ${state.commandError ? `<p class="command-error">${escapeHtml(state.commandError)}</p>` : ""}
+      ${definition.danger && state.commandConfirming ? '<p class="command-warning">This command can remove access, affect players, or stop the server. Check the preview before confirming.</p>' : ""}
+      <div class="command-preview"><span>Command preview</span><code>${escapeHtml(currentCommandPreview())}</code></div>
+      <div class="command-builder-actions"><button class="secondary" id="backToCommands" type="button">Back</button><button class="${definition.danger ? "danger" : "primary"}" id="runGuidedCommand" type="button" ${state.runtime?.status !== "running" ? 'disabled title="Start the server to run commands"' : ""}>${state.runtime?.status !== "running" ? "Server offline" : definition.danger ? (state.commandConfirming ? "Confirm and run" : "Review command") : "Run command"}</button></div>
+    </section>`;
+  }
+  const matches = searchCommands(state.commandSearch);
+  return `<section class="command-palette" aria-label="Command library">
+    <header><div><strong>Command library</strong><small>Choose a command and BlockHost will build it with you.</small></div><button id="closeCommandAssistant" type="button" aria-label="Close command library">×</button></header>
+    <input id="commandSearch" value="${escapeHtml(state.commandSearch)}" placeholder="Search commands, e.g. player, weather, whitelist…" autocomplete="off" />
+    <div class="command-results">${matches.length ? matches.map((command) => `<button type="button" data-command-id="${escapeHtml(command.id)}"><span><strong>${escapeHtml(command.name)}</strong><small>${escapeHtml(command.description)}</small></span><code>${escapeHtml(command.syntax)}</code></button>`).join("") : '<p class="command-no-results">No matching built-in commands. You can still type any command below.</p>'}</div>
+  </section>`;
 }
 
 function showError(error, retry = null) {
@@ -195,6 +455,7 @@ async function refreshLive() {
 function updateLiveElements() {
   const runtime = state.runtime || { status: "offline", logs: [] };
   const usage = runtimeUsage();
+  const runs = runMetrics(runtime);
   const status = document.getElementById("runtimeStatus");
   if (status) {
     status.textContent = statusLabel(runtime.status);
@@ -204,18 +465,19 @@ function updateLiveElements() {
   if (cpu) cpu.textContent = `${(Number(usage?.cpuPercent) || 0).toFixed(1)}%`;
   const ram = document.getElementById("ramValue");
   if (ram) ram.textContent = formatBytes(usage?.ramBytes || 0);
-  const pid = document.getElementById("pidValue");
-  if (pid) pid.textContent = runtime.pid ? String(runtime.pid) : "—";
-
-  const consoleOutput = document.getElementById("consoleOutput");
-  if (consoleOutput) {
-    const wasAtBottom =
-      consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 40;
-    consoleOutput.textContent = runtime.logs?.length
-      ? runtime.logs.join("\n")
-      : "Server output will appear here.";
-    if (wasAtBottom) consoleOutput.scrollTop = consoleOutput.scrollHeight;
+  const uptime = document.getElementById("uptimeValue");
+  const uptimeDetail = document.getElementById("uptimeDetail");
+  const lastRun = document.getElementById("lastRunValue");
+  const lastRunDetail = document.getElementById("lastRunDetail");
+  if (uptime) uptime.textContent = runs.uptime;
+  if (uptimeDetail) uptimeDetail.textContent = runs.uptimeDetail;
+  if (lastRun) lastRun.textContent = runs.lastRun;
+  if (lastRunDetail) {
+    lastRunDetail.textContent = runs.lastRunDetail;
+    lastRunDetail.title = runs.lastRunTitle;
   }
+
+  syncConsoleOutput();
 
   const start = document.getElementById("startServer");
   const stop = document.getElementById("stopServer");
@@ -283,6 +545,11 @@ async function startServer(options = {}) {
       render();
       return;
     }
+    if (runtime.requiresPortConflict) {
+      state.pendingStart = { kind: "port-conflict", portConflict: runtime.portConflict };
+      render();
+      return;
+    }
     state.runtime = runtime;
   } catch (error) {
     const message = error.message || "";
@@ -316,11 +583,22 @@ async function stopServer() {
 async function submitCommand(event) {
   event.preventDefault();
   const input = event.currentTarget.command;
-  const command = input.value.trim();
+  let command;
+  try {
+    command = normalizeRawCommand(input.value);
+  } catch (error) {
+    showError(error);
+    return;
+  }
   if (!command) return;
   input.value = "";
+  await runConsoleCommand(command);
+}
+
+async function runConsoleCommand(command) {
   try {
     state.runtime = await window.minecraftAPI.sendCommand(state.selectedId, command);
+    state.commandHistory = [command, ...state.commandHistory.filter((item) => item !== command)].slice(0, 30);
     updateLiveElements();
   } catch (error) {
     showError(error);
@@ -567,13 +845,16 @@ async function exportSelectedWorld() {
 
 async function openAddons() {
   if (!state.selectedId || state.addonsLoading) return;
+  addonSearchRequestSequence += 1;
   state.addonsOpen = true;
   state.addonsLoading = true;
   state.addonsModel = null;
   state.addonResults = [];
+  state.addonHasSearched = false;
   state.addonError = "";
   state.addonSearchStatus = "";
   state.addonRemoveId = null;
+  state.addonInstalledFilter = "all";
   state.addonRecommendations = [];
   state.addonRecommendationsLoading = true;
   state.addonRecommendationsError = "";
@@ -605,25 +886,42 @@ async function openAddons() {
 
 async function searchAddons(event) {
   event.preventDefault();
-  if (state.addonSearching || !state.selectedId) return;
   const form = event.currentTarget;
   state.addonQuery = form.query.value.trim();
-  if (!state.addonQuery) {
-    state.addonResults = [];
-    render();
-    return;
-  }
+  await performAddonSearch();
+}
+
+async function performAddonSearch() {
+  if (!state.selectedId || state.addonsPending) return;
+  const requestId = ++addonSearchRequestSequence;
+  const request = {
+    serverId: state.selectedId,
+    query: state.addonQuery,
+    category: state.addonCategory,
+    sort: state.addonSort,
+  };
+  state.addonHasSearched = true;
   state.addonSearching = true;
+  state.addonResults = [];
   state.addonError = "";
   state.addonSearchStatus = "";
   render();
   try {
-    const result = await window.minecraftAPI.searchAddons(state.selectedId, state.addonQuery);
+    const result = await window.minecraftAPI.searchAddons(request.serverId, request.query, {
+      category: request.category,
+      sort: request.sort,
+    });
+    if (requestId !== addonSearchRequestSequence) return;
+    if (result?.searchContract !== 2) {
+      throw new Error("BlockHost updated the add-on browser. Fully quit BlockHost from the tray, then open it again to activate category browsing.");
+    }
     state.addonResults = result.results || [];
     state.addonSearchStatus = result.offlineMessage || "";
   } catch (error) {
+    if (requestId !== addonSearchRequestSequence) return;
     state.addonError = error.message || "Could not search for add-ons";
   } finally {
+    if (requestId !== addonSearchRequestSequence) return;
     state.addonSearching = false;
     render();
   }
@@ -635,6 +933,7 @@ async function runAddonAction(label, action) {
   state.addonError = "";
   clearNotice(false);
   render();
+  let succeeded = false;
   try {
     const result = await action();
     if (result?.cancelled) return;
@@ -644,6 +943,7 @@ async function runAddonAction(label, action) {
     const restartText = result?.restarted ? " The server restarted successfully." : "";
     const warningText = result?.warnings?.length ? ` ${result.warnings.join(" ")}` : "";
     showNotice(`${label} complete.${restartText}${warningText}`);
+    succeeded = true;
   } catch (error) {
     state.addonError = error.message || `${label} failed`;
     await refreshLive().catch(() => {});
@@ -651,6 +951,7 @@ async function runAddonAction(label, action) {
     state.addonsPending = "";
     render();
   }
+  return succeeded;
 }
 
 async function checkAddonUpdatesNow() {
@@ -834,6 +1135,7 @@ function renderServer() {
   const server = selectedServer();
   const runtime = state.runtime || { status: "offline", logs: [] };
   const usage = runtimeUsage();
+  const runs = runMetrics(runtime);
   return `
     <main class="content">
       <header class="server-header">
@@ -853,15 +1155,23 @@ function renderServer() {
       <section class="metrics" aria-label="Server resource usage">
         <article><span>CPU usage</span><strong id="cpuValue">${(Number(usage?.cpuPercent) || 0).toFixed(1)}%</strong></article>
         <article><span>RAM usage</span><strong id="ramValue">${formatBytes(usage?.ramBytes || 0)}</strong></article>
-        <article><span>Process ID</span><strong id="pidValue">${runtime.pid || "—"}</strong></article>
+        <article><span>Uptime</span><strong id="uptimeValue">${escapeHtml(runs.uptime)}</strong><small id="uptimeDetail">${escapeHtml(runs.uptimeDetail)}</small></article>
+        <article><span>Last run</span><strong id="lastRunValue">${escapeHtml(runs.lastRun)}</strong><small id="lastRunDetail" title="${escapeHtml(runs.lastRunTitle)}">${escapeHtml(runs.lastRunDetail)}</small></article>
       </section>
 
       <section class="console-card">
-        <div class="console-title"><div><span class="terminal-dot red"></span><span class="terminal-dot yellow"></span><span class="terminal-dot green"></span></div><strong>Server console</strong></div>
-        <pre id="consoleOutput" tabindex="0">${escapeHtml(runtime.logs?.length ? runtime.logs.join("\n") : "Server output will appear here.")}</pre>
+        <div class="console-title"><div class="console-title-name"><span class="terminal-dot red"></span><span class="terminal-dot yellow"></span><span class="terminal-dot green"></span><strong>Server console</strong><span class="console-error-count" id="consoleErrorCount" ${consoleErrorCount() ? "" : "hidden"}>${consoleErrorCount() || ""}</span></div><div class="console-title-actions"><button id="copyVisibleConsole" type="button">${escapeHtml(consoleCopyLabel())}</button><button id="clearConsoleView" type="button">Clear view</button></div></div>
+        <div class="console-toolbar">
+          <div class="console-filters" role="group" aria-label="Console filters">${[["all", "All"], ["players", "Players"], ["warnings", "Warnings"], ["errors", "Errors"]].map(([value, label]) => `<button type="button" data-console-filter="${value}" class="${state.consoleFilter === value ? "active" : ""}">${label}</button>`).join("")}</div>
+          <input id="consoleSearch" value="${escapeHtml(state.consoleSearch)}" placeholder="Search console…" aria-label="Search console output" />
+          <label class="console-autoscroll"><input id="consoleAutoScroll" type="checkbox" ${state.consoleAutoScroll ? "checked" : ""} /> Auto-scroll</label>
+        </div>
+        <div class="console-output-wrap"><div id="consoleOutput" class="console-output" tabindex="0" role="log" aria-live="polite">${renderConsoleRows()}</div><button id="jumpConsoleLatest" type="button" hidden>Jump to latest ↓</button></div>
+        ${renderCommandAssistant()}
         <form class="command-form" id="commandForm">
+          <button class="command-library-button" id="openCommandAssistant" type="button">Commands</button>
           <span>&gt;</span>
-          <input id="commandInput" name="command" autocomplete="off" placeholder="Enter a server command" ${runtime.status !== "running" ? "disabled" : ""} />
+          <input id="commandInput" name="command" autocomplete="off" placeholder="Enter any server command" ${runtime.status !== "running" ? "disabled" : ""} />
           <button id="sendCommand" type="submit" ${runtime.status !== "running" ? "disabled" : ""}>Send</button>
         </form>
       </section>
@@ -1162,6 +1472,10 @@ function renderInstalledAddon(item) {
 
 function renderAddonSearchResult(result, recommendation = false) {
   const pending = Boolean(state.addonsPending);
+  const installed = (state.addonsModel?.items || []).find((item) => item.projectId === result.projectId);
+  const compatibility = recommendation && result.versionNumber
+    ? `Verified ${result.versionNumber}`
+    : `Minecraft ${selectedServer()?.version || "server"} · checked before install`;
   return `
     <article class="addon-card search-result ${recommendation ? "recommendation-card" : ""}">
       ${renderAddonIcon(result)}
@@ -1169,9 +1483,13 @@ function renderAddonSearchResult(result, recommendation = false) {
         <div class="addon-heading"><strong>${escapeHtml(result.title)}</strong><span>${formatCompactNumber(result.downloads)} downloads</span></div>
         <p>${escapeHtml(result.description || "No description provided.")}</p>
         <small>By ${escapeHtml(result.author || "Unknown author")}</small>
+        <small class="addon-compatibility">${escapeHtml(compatibility)}</small>
       </div>
       <div class="addon-actions">
-        <button class="primary small" data-addon-action="install" data-project-id="${escapeHtml(result.projectId)}" data-project-title="${escapeHtml(result.title)}" data-icon-url="${escapeHtml(result.iconUrl || "")}" type="button" ${pending ? "disabled" : ""}>Install</button>
+        <button class="secondary small" data-addon-action="details" data-project-id="${escapeHtml(result.projectId)}" type="button">Details</button>
+        ${installed
+          ? `<button class="installed-addon small" type="button" disabled>${installed.enabled ? "Installed" : "Installed · disabled"}</button>`
+          : `<button class="primary small" data-addon-action="install" data-project-id="${escapeHtml(result.projectId)}" data-version-id="${escapeHtml(result.versionId || "")}" data-project-title="${escapeHtml(result.title)}" data-icon-url="${escapeHtml(result.iconUrl || "")}" type="button" ${pending ? "disabled" : ""}>Install</button>`}
       </div>
     </article>`;
 }
@@ -1204,11 +1522,32 @@ function renderAddonsModal() {
 
   const items = state.addonsModel.items || [];
   const kind = state.addonsModel.kind;
+  const installedCounts = {
+    all: items.length,
+    enabled: items.filter((item) => item.enabled).length,
+    disabled: items.filter((item) => !item.enabled).length,
+    updates: items.filter((item) => item.update?.available).length,
+  };
+  const visibleItems = items.filter((item) => {
+    if (state.addonInstalledFilter === "enabled") return item.enabled;
+    if (state.addonInstalledFilter === "disabled") return !item.enabled;
+    if (state.addonInstalledFilter === "updates") return item.update?.available;
+    return true;
+  });
+  const categoryOptions = [
+    ["all", "All"],
+    ["performance", "Performance"],
+    ["administration", "Administration"],
+    ["world", "World"],
+    ["social", "Social"],
+    ["gameplay", "Gameplay"],
+    ["libraries", "Libraries"],
+  ];
   const resultText = state.addonSearching
     ? "Searching compatible releases…"
     : state.addonResults.length
       ? `${state.addonResults.length} compatible result${state.addonResults.length === 1 ? "" : "s"}`
-      : state.addonQuery ? "No compatible results found." : `Search for ${kind} compatible with ${server.typeLabel} ${server.version}.`;
+      : state.addonHasSearched ? "No compatible results found for these filters." : `Browse ${kind} compatible with ${server.typeLabel} ${server.version}.`;
   return `
     <div class="overlay">
       <section class="modal addons-modal" role="dialog" aria-modal="true" aria-labelledby="addonsTitle">
@@ -1231,8 +1570,11 @@ function renderAddonsModal() {
         </div>
 
         <section class="addon-section">
-          <h3>Installed ${escapeHtml(kind)} <span>${items.length}</span></h3>
-          <div class="addon-list">${items.length ? items.map(renderInstalledAddon).join("") : `<p class="addon-empty">No ${escapeHtml(kind)} are installed yet.</p>`}</div>
+          <div class="addon-section-title installed-title"><div><h3>Installed ${escapeHtml(kind)} <span>${items.length}</span></h3><p>Enable, disable, update, or roll back managed files.</p></div></div>
+          <div class="addon-filter-row" role="group" aria-label="Filter installed add-ons">
+            ${Object.entries(installedCounts).map(([filter, count]) => `<button class="addon-filter-chip ${state.addonInstalledFilter === filter ? "active" : ""}" data-installed-filter="${filter}" type="button">${filter === "all" ? "All" : filter[0].toUpperCase() + filter.slice(1)} <span>${count}</span></button>`).join("")}
+          </div>
+          <div class="addon-list">${visibleItems.length ? visibleItems.map(renderInstalledAddon).join("") : `<p class="addon-empty">${items.length ? `No ${escapeHtml(state.addonInstalledFilter)} ${escapeHtml(kind)} found.` : `No ${escapeHtml(kind)} are installed yet.`}</p>`}</div>
         </section>
 
         <section class="addon-section addon-recommendations-section">
@@ -1245,13 +1587,22 @@ function renderAddonsModal() {
         </section>
 
         <section class="addon-section addon-search-section">
-          <h3>Find compatible ${escapeHtml(kind)}</h3>
+          <div class="addon-section-title"><div><h3>Explore compatible ${escapeHtml(kind)}</h3><p>Browse by purpose, or search for exactly what your server needs.</p></div></div>
+          <div class="addon-category-chips" role="group" aria-label="Add-on category">
+            ${categoryOptions.map(([value, label]) => `<button class="addon-filter-chip ${state.addonCategory === value ? "active" : ""}" data-addon-category="${value}" type="button" ${state.addonsPending ? "disabled" : ""}>${label}</button>`).join("")}
+          </div>
           <form class="addon-search" id="addonSearchForm">
             <input name="query" value="${escapeHtml(state.addonQuery)}" maxlength="100" autocomplete="off" placeholder="Search by name or feature" />
-            <button class="primary" type="submit" ${state.addonSearching || state.addonsPending ? "disabled" : ""}>${state.addonSearching ? "Searching…" : "Search"}</button>
+            <select id="addonSort" aria-label="Sort add-ons" ${state.addonsPending ? "disabled" : ""}>
+              <option value="relevance" ${state.addonSort === "relevance" ? "selected" : ""}>Most relevant</option>
+              <option value="downloads" ${state.addonSort === "downloads" ? "selected" : ""}>Most downloaded</option>
+              <option value="updated" ${state.addonSort === "updated" ? "selected" : ""}>Recently updated</option>
+              <option value="newest" ${state.addonSort === "newest" ? "selected" : ""}>Newest</option>
+            </select>
+            <button class="primary" type="submit" ${state.addonsPending ? "disabled" : ""}>${state.addonSearching ? "Loading…" : state.addonQuery ? "Search" : "Browse"}</button>
           </form>
           <p class="addon-search-status">${escapeHtml(state.addonSearchStatus || resultText)}</p>
-          <div class="addon-list">${state.addonResults.map(renderAddonSearchResult).join("")}</div>
+          <div class="addon-list">${state.addonResults.map((item) => renderAddonSearchResult(item)).join("")}</div>
         </section>
 
         ${state.addonError ? `<p class="form-error">${escapeHtml(state.addonError)}</p>` : ""}
@@ -1277,6 +1628,15 @@ function renderStartModal() {
         <h2 id="switchTitle">Switch running server?</h2>
         <p>${escapeHtml(state.pendingStart.activeServer?.serverName || "Another server")} is running. It will be stopped before this server starts.</p>
         <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Cancel</button><button class="primary" id="confirmSwitch" type="button">Stop and switch</button></div>
+      </section></div>`;
+  }
+  if (state.pendingStart.kind === "port-conflict") {
+    const conflict = state.pendingStart.portConflict || {};
+    return `
+      <div class="overlay"><section class="modal compact" role="dialog" aria-modal="true" aria-labelledby="portConflictTitle">
+        <h2 id="portConflictTitle">Server port is already in use</h2>
+        <p>Port <strong>${escapeHtml(conflict.port || 25565)}</strong> on ${escapeHtml(conflict.host || "this computer")} is being used by another Minecraft server or application. Stop the other server, or choose a different port in Server properties.</p>
+        <div class="modal-actions"><button class="secondary" id="cancelStart" type="button">Cancel</button><button class="secondary" id="openConflictProperties" type="button">Open properties</button><button class="primary" id="retryStart" type="button">Try again</button></div>
       </section></div>`;
   }
   return `
@@ -1441,6 +1801,9 @@ function bindEvents() {
     button.addEventListener("click", async () => {
       state.selectedId = Number(button.dataset.serverId);
       state.runtime = null;
+      state.consoleClearedBeforeId = 0;
+      state.commandAssistantOpen = false;
+      state.selectedCommandId = "";
       state.quickPropertiesModel = null;
       render();
       await Promise.all([refreshLive(), loadQuickProperties()]);
@@ -1483,6 +1846,172 @@ function bindEvents() {
   document.getElementById("startServer")?.addEventListener("click", () => startServer());
   document.getElementById("stopServer")?.addEventListener("click", stopServer);
   document.getElementById("commandForm")?.addEventListener("submit", submitCommand);
+  document.querySelectorAll("[data-console-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.consoleFilter = button.dataset.consoleFilter;
+      document.querySelectorAll("[data-console-filter]").forEach((item) => item.classList.toggle("active", item === button));
+      const copyButton = document.getElementById("copyVisibleConsole");
+      if (copyButton) copyButton.textContent = consoleCopyLabel();
+      syncConsoleOutput();
+    });
+  });
+  document.getElementById("consoleSearch")?.addEventListener("input", (event) => {
+    state.consoleSearch = event.target.value;
+    syncConsoleOutput();
+  });
+  document.getElementById("consoleAutoScroll")?.addEventListener("change", (event) => {
+    state.consoleAutoScroll = event.target.checked;
+    if (state.consoleAutoScroll) {
+      const output = document.getElementById("consoleOutput");
+      output?.scrollTo({ top: output.scrollHeight });
+    }
+  });
+  document.getElementById("consoleOutput")?.addEventListener("scroll", (event) => {
+    const output = event.currentTarget;
+    const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
+    const latest = document.getElementById("jumpConsoleLatest");
+    if (latest) latest.hidden = atBottom;
+  });
+  document.getElementById("consoleOutput")?.addEventListener("wheel", (event) => {
+    if (event.deltaY >= 0 || !state.consoleAutoScroll) return;
+    state.consoleAutoScroll = false;
+    const toggle = document.getElementById("consoleAutoScroll");
+    if (toggle) toggle.checked = false;
+  }, { passive: true });
+  document.getElementById("jumpConsoleLatest")?.addEventListener("click", () => {
+    const output = document.getElementById("consoleOutput");
+    if (output) output.scrollTop = output.scrollHeight;
+    state.consoleAutoScroll = true;
+    const toggle = document.getElementById("consoleAutoScroll");
+    if (toggle) toggle.checked = true;
+  });
+  document.getElementById("copyVisibleConsole")?.addEventListener("click", () => {
+    const text = visibleConsoleEntries().map((entry) => entry.raw).join("\n");
+    if (!text) {
+      showNotice("There is no output in the current console view.");
+      return;
+    }
+    const viewName = state.consoleFilter === "all" ? "All console output" : `${consoleCopyLabel().replace("Copy ", "")} view`;
+    writeClipboard(text, `${viewName} copied.`);
+  });
+  document.getElementById("clearConsoleView")?.addEventListener("click", () => {
+    state.consoleClearedBeforeId = Math.max(0, ...consoleEntries().map((entry) => Number(entry.id) || 0));
+    syncConsoleOutput();
+    showNotice("Console view cleared. Minecraft log files were not deleted.");
+  });
+  document.getElementById("consoleOutput")?.addEventListener("click", (event) => {
+    const copyError = event.target.closest("[data-copy-error]");
+    const copyDiagnostics = event.target.closest("[data-copy-diagnostics]");
+    const groupId = copyError?.dataset.copyError || copyDiagnostics?.dataset.copyDiagnostics;
+    if (!groupId) return;
+    const entries = errorGroupEntries(groupId);
+    if (copyDiagnostics) writeClipboard(diagnosticText(entries), "Diagnostic details copied for support or AI help.");
+    else writeClipboard(entries.map((entry) => entry.raw).join("\n"), "Complete error copied.");
+  });
+  document.getElementById("openCommandAssistant")?.addEventListener("click", () => {
+    state.commandAssistantOpen = !state.commandAssistantOpen;
+    state.selectedCommandId = "";
+    state.commandError = "";
+    state.commandConfirming = false;
+    render();
+    document.getElementById("commandSearch")?.focus();
+  });
+  document.getElementById("closeCommandAssistant")?.addEventListener("click", () => {
+    state.commandAssistantOpen = false;
+    state.selectedCommandId = "";
+    state.commandConfirming = false;
+    render();
+  });
+  document.getElementById("commandSearch")?.addEventListener("input", (event) => {
+    state.commandSearch = event.target.value;
+    const position = event.target.selectionStart;
+    render();
+    const search = document.getElementById("commandSearch");
+    search?.focus();
+    search?.setSelectionRange(position, position);
+  });
+  document.getElementById("commandSearch")?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      document.querySelector("[data-command-id]")?.focus();
+    } else if (event.key === "Escape") {
+      state.commandAssistantOpen = false;
+      render();
+      document.getElementById("commandInput")?.focus();
+    }
+  });
+  document.querySelectorAll("[data-command-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const definition = commandDefinition(button.dataset.commandId);
+      state.selectedCommandId = definition?.id || "";
+      state.commandValues = Object.fromEntries((definition?.fields || []).map((field) => [field.name, field.default || ""]));
+      state.commandError = "";
+      state.commandConfirming = false;
+      render();
+      document.querySelector("[data-command-field]")?.focus();
+    });
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowDown", "ArrowUp", "Escape"].includes(event.key)) return;
+      event.preventDefault();
+      if (event.key === "Escape") {
+        document.getElementById("commandSearch")?.focus();
+        return;
+      }
+      const buttons = [...document.querySelectorAll("[data-command-id]")];
+      const index = buttons.indexOf(button);
+      const next = event.key === "ArrowDown" ? Math.min(buttons.length - 1, index + 1) : Math.max(0, index - 1);
+      buttons[next]?.focus();
+    });
+  });
+  document.querySelectorAll("[data-command-field]").forEach((field) => {
+    field.addEventListener("input", () => {
+      state.commandValues[field.dataset.commandField] = field.value;
+      state.commandError = "";
+      state.commandConfirming = false;
+      const preview = document.querySelector(".command-preview code");
+      if (preview) preview.textContent = currentCommandPreview();
+      document.querySelector(".command-warning")?.remove();
+      const run = document.getElementById("runGuidedCommand");
+      if (run && selectedCommand()?.danger) run.textContent = "Review command";
+    });
+  });
+  document.getElementById("backToCommands")?.addEventListener("click", () => {
+    state.selectedCommandId = "";
+    state.commandValues = {};
+    state.commandError = "";
+    state.commandConfirming = false;
+    render();
+    document.getElementById("commandSearch")?.focus();
+  });
+  document.getElementById("runGuidedCommand")?.addEventListener("click", async () => {
+    const definition = selectedCommand();
+    if (!definition) return;
+    let command;
+    try {
+      command = buildCommand(definition.id, state.commandValues);
+    } catch (error) {
+      state.commandError = error.message;
+      render();
+      return;
+    }
+    if (definition.danger && !state.commandConfirming) {
+      state.commandConfirming = true;
+      render();
+      return;
+    }
+    state.commandAssistantOpen = false;
+    state.selectedCommandId = "";
+    state.commandConfirming = false;
+    render();
+    await runConsoleCommand(command);
+  });
+  document.getElementById("commandInput")?.addEventListener("keydown", (event) => {
+    if (!state.commandHistory.length || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "ArrowUp") state.commandHistoryIndex = Math.min(state.commandHistory.length - 1, state.commandHistoryIndex + 1);
+    else state.commandHistoryIndex = Math.max(-1, state.commandHistoryIndex - 1);
+    event.currentTarget.value = state.commandHistoryIndex < 0 ? "" : state.commandHistory[state.commandHistoryIndex];
+  });
   document.getElementById("quickPropertiesForm")?.addEventListener("submit", saveQuickProperties);
   document.querySelectorAll("[data-quick-adjust]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1582,6 +2111,16 @@ function bindEvents() {
     state.pendingStart = null;
     render();
   });
+  document.getElementById("retryStart")?.addEventListener("click", () => {
+    state.pendingStart = null;
+    render();
+    startServer();
+  });
+  document.getElementById("openConflictProperties")?.addEventListener("click", () => {
+    state.pendingStart = null;
+    render();
+    openProperties();
+  });
   document.getElementById("skipJavaSetup")?.addEventListener("click", () => {
     state.javaSetup = null;
     render();
@@ -1677,9 +2216,12 @@ function bindEvents() {
   document.getElementById("savePropertiesLater")?.addEventListener("click", () => saveProperties(false));
   const closeAddons = () => {
     if (state.addonsPending) return;
+    addonSearchRequestSequence += 1;
     state.addonsOpen = false;
     state.addonsModel = null;
     state.addonResults = [];
+    state.addonHasSearched = false;
+    state.addonSearching = false;
     state.addonError = "";
     state.addonSearchStatus = "";
     state.addonRemoveId = null;
@@ -1691,6 +2233,22 @@ function bindEvents() {
   document.getElementById("closeAddonsBottom")?.addEventListener("click", closeAddons);
   document.getElementById("retryAddons")?.addEventListener("click", openAddons);
   document.getElementById("addonSearchForm")?.addEventListener("submit", searchAddons);
+  document.getElementById("addonSort")?.addEventListener("change", async (event) => {
+    state.addonSort = event.target.value;
+    await performAddonSearch();
+  });
+  document.querySelectorAll("[data-addon-category]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      state.addonCategory = button.dataset.addonCategory;
+      await performAddonSearch();
+    });
+  });
+  document.querySelectorAll("[data-installed-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.addonInstalledFilter = button.dataset.installedFilter;
+      render();
+    });
+  });
   document.getElementById("installManualAddon")?.addEventListener("click", () =>
     runAddonAction("Manual installation", () => window.minecraftAPI.installManualAddon(state.selectedId))
   );
@@ -1698,16 +2256,25 @@ function bindEvents() {
   document.getElementById("updateAllAddons")?.addEventListener("click", () =>
     runAddonAction("Update all", () => window.minecraftAPI.updateAllAddons(state.selectedId))
   );
-  document.getElementById("addonReleaseChannel")?.addEventListener("change", (event) =>
-    runAddonAction("Release channel update", () => window.minecraftAPI.setAddonReleaseChannel(state.selectedId, event.target.value))
-  );
+  document.getElementById("addonReleaseChannel")?.addEventListener("change", async (event) => {
+    const succeeded = await runAddonAction("Release channel update", () =>
+      window.minecraftAPI.setAddonReleaseChannel(state.selectedId, event.target.value)
+    );
+    if (succeeded && state.addonsOpen) await openAddons();
+  });
   document.querySelectorAll("[data-addon-action]").forEach((button) => {
     button.addEventListener("click", () => {
       const action = button.dataset.addonAction;
       const addonId = button.dataset.addonId;
-      if (action === "install") {
+      if (action === "details") {
+        window.minecraftAPI.openAddonProject(button.dataset.projectId).catch((error) => {
+          state.addonError = error.message || "Could not open the project page";
+          render();
+        });
+      } else if (action === "install") {
         runAddonAction("Installation", () => window.minecraftAPI.installAddon(state.selectedId, {
           projectId: button.dataset.projectId,
+          versionId: button.dataset.versionId,
           title: button.dataset.projectTitle,
           iconUrl: button.dataset.iconUrl,
         }));
@@ -1773,6 +2340,18 @@ window.minecraftAPI.onTransferProgress((progress) => {
 window.minecraftAPI.onOperationsChanged((operations) => {
   state.operations = Array.isArray(operations) ? operations : [];
   render();
+});
+
+window.minecraftAPI.onConsoleEntry((payload) => {
+  if (!payload?.entry || Number(payload.serverId) !== Number(state.selectedId) || !state.runtime) return;
+  const logs = state.runtime.logs || (state.runtime.logs = []);
+  if (!logs.some((entry) => Number(entry?.id) === Number(payload.entry.id))) logs.push(payload.entry);
+  if (logs.length > 2000) logs.splice(0, logs.length - 2000);
+  const players = new Set(state.runtime.onlinePlayers || []);
+  if (payload.entry.event === "player-join" && payload.entry.playerName) players.add(payload.entry.playerName);
+  if (payload.entry.event === "player-leave" && payload.entry.playerName) players.delete(payload.entry.playerName);
+  state.runtime.onlinePlayers = [...players].sort((a, b) => a.localeCompare(b));
+  syncConsoleOutput();
 });
 
 window.minecraftAPI.onDependencyProgress((progress) => {

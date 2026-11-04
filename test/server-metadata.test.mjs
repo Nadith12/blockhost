@@ -38,3 +38,17 @@ test("metadata rejects unsafe ids and normalizes unsupported values", () => {
   assert.equal(memory.minMemoryMb, 1024);
   assert.equal(memory.maxMemoryMb, 6144);
 });
+
+test("metadata keeps a valid last-start time and rejects damaged values", () => {
+  const valid = migrateServerMetadata({
+    id: 8,
+    lastStartedAt: "2026-11-04T01:00:00.000Z",
+  });
+  assert.equal(valid.lastStartedAt, "2026-11-04T01:00:00.000Z");
+
+  const damaged = migrateServerMetadata({
+    id: 9,
+    lastStartedAt: "not-a-date",
+  });
+  assert.equal(damaged.lastStartedAt, "");
+});

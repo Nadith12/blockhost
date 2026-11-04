@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell, Tray } from "electron";
 import started from "electron-squirrel-startup";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -62,10 +62,12 @@ import {
 import { exportWorld, importWorld } from "./lib/world-manager.mjs";
 import { assertSupportedJavaRuntime, parseJavaRuntimeDetails, requiredJavaVersion } from "./lib/java-runtime.mjs";
 import { cleanupManagedJavaArtifacts, findJavaExecutable, installManagedJava, isManagedJavaReady } from "./lib/managed-java.mjs";
+import { probeServerPort, serverEndpoint } from "./lib/server-port.mjs";
+import { attachErrorGroup, parseConsoleLine, updateOnlinePlayers } from "./lib/console-log.mjs";
 
 const execFileAsync = promisify(execFile);
 const APP_NAME = "BlockHost Manager";
-const APP_USER_AGENT = "BlockHostManager/1.0.5";
+const APP_USER_AGENT = "BlockHostManager/1.0.6";
 const DEFAULT_COLOR = "#39c9ff";
 const MINECRAFT_EULA_URL = "https://aka.ms/MinecraftEULA";
 const JAVA_INSTALL_URL = "https://adoptium.net/temurin/releases/?package=jdk";
@@ -85,8 +87,10 @@ const approvedWorldSources = new Map();
 let javaInstallPromise = null;
 
 let mainWindow;
+let tray;
 let quitInProgress = false;
 let quitAfterTransfers = false;
+let quitPromptOpen = false;
 let activeTransfers = 0;
 
 async function finishQueuedQuit() {
@@ -96,6 +100,62 @@ async function finishQueuedQuit() {
   quitInProgress = true;
   await stopAllServers();
   app.quit();
+}
+
+function runningServerEntries() {
+  return Array.from(runningServers.entries()).filter(([, runtime]) =>
+    runtime.process && runtime.status !== "offline"
+  );
+}
+
+async function confirmRunningServersQuit(entries) {
+  const names = entries
+    .map(([serverId]) => getServer(serverId)?.name || `Server ${serverId}`)
+    .join(", ");
+  const count = entries.length;
+  const options = {
+    type: "warning",
+    title: `Quit ${APP_NAME}?`,
+    message: `${count === 1 ? "A Minecraft server is" : `${count} Minecraft servers are`} still running.`,
+    detail: `${names}\n\nBlockHost will send Minecraft's stop command and wait for the server to save before quitting.`,
+    buttons: ["Stop server and quit", "Keep BlockHost open"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  };
+  const owner = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : null;
+  const result = owner
+    ? await dialog.showMessageBox(owner, options)
+    : await dialog.showMessageBox(options);
+  return result.response === 0;
+}
+
+async function requestApplicationQuit() {
+  if (quitInProgress || quitPromptOpen) return;
+  const running = runningServerEntries();
+  if (running.length) {
+    quitPromptOpen = true;
+    let confirmed = false;
+    try {
+      confirmed = await confirmRunningServersQuit(running);
+    } finally {
+      quitPromptOpen = false;
+    }
+    if (!confirmed) return;
+  }
+
+  if (activeTransfers > 0 || getActiveOperations().length > 0) {
+    quitAfterTransfers = true;
+    finishQueuedQuit();
+    return;
+  }
+
+  quitInProgress = true;
+  try {
+    await stopAllServers();
+  } finally {
+    app.quit();
+  }
 }
 
 class MissingJavaError extends Error {
@@ -553,11 +613,22 @@ function acceptEula(server) {
   );
 }
 
-function appendLog(runtime, value) {
+function appendLog(runtime, value, source = "app") {
   const line = String(value).trimEnd();
   if (!line) return;
-  runtime.logs.push(line);
-  if (runtime.logs.length > 300) runtime.logs.splice(0, runtime.logs.length - 300);
+  runtime.nextLogId = (runtime.nextLogId || 0) + 1;
+  const parsed = parseConsoleLine(line, {
+    id: runtime.nextLogId,
+    source,
+    receivedAt: new Date().toISOString(),
+  });
+  const entry = attachErrorGroup(parsed, runtime.errorGrouping || (runtime.errorGrouping = {}));
+  runtime.onlinePlayers = updateOnlinePlayers(runtime.onlinePlayers, entry);
+  runtime.logs.push(entry);
+  if (runtime.logs.length > 2000) runtime.logs.splice(0, runtime.logs.length - 2000);
+  if (mainWindow && !mainWindow.isDestroyed() && runtime.serverId) {
+    mainWindow.webContents.send("servers:consoleEntry", { serverId: runtime.serverId, entry });
+  }
 }
 
 function runtimeSnapshot(id) {
@@ -570,17 +641,17 @@ function runtimeSnapshot(id) {
     pid: runtime?.status !== "offline" ? runtime?.process?.pid || null : null,
     startedAt: runtime?.startedAt || null,
     stoppedAt: runtime?.stoppedAt || null,
+    lastStartedAt: runtime?.startedAt || server?.lastStartedAt || null,
     exitCode: runtime?.exitCode ?? null,
     logs: runtime?.logs || [],
+    onlinePlayers: runtime?.onlinePlayers ? [...runtime.onlinePlayers].sort((a, b) => a.localeCompare(b)) : [],
     eulaAccepted: server ? eulaAccepted(server) : false,
     eulaUrl: MINECRAFT_EULA_URL,
   };
 }
 
 function runningEntry() {
-  return Array.from(runningServers.entries()).find(([, runtime]) =>
-    runtime.process && runtime.status !== "offline"
-  );
+  return runningServerEntries()[0];
 }
 
 function defaultMaxMemoryMb() {
@@ -676,6 +747,21 @@ async function startServer(id, options = {}) {
 
   const server = getServer(serverId);
   if (!server) throw new Error("Saved server not found");
+
+  const endpoint = serverEndpoint(loadServerProperties(server.folderPath, server.version).values);
+  const portStatus = await probeServerPort(endpoint);
+  if (!portStatus.available) {
+    return {
+      ...runtimeSnapshot(serverId),
+      requiresPortConflict: true,
+      portConflict: {
+        port: endpoint.port,
+        host: endpoint.displayHost,
+        reason: portStatus.code,
+      },
+    };
+  }
+
   if (!eulaAccepted(server)) {
     if (!options.acceptEula) return { ...runtimeSnapshot(serverId), requiresEula: true };
     acceptEula(server);
@@ -684,12 +770,17 @@ async function startServer(id, options = {}) {
   const javaRuntime = await assertJavaInstalled(server.version);
   const [command, args] = launchCommand(server, javaRuntime.command);
   const runtime = {
+    serverId,
     status: "starting",
     process: null,
     startedAt: new Date().toISOString(),
     stoppedAt: null,
     exitCode: null,
     logs: [],
+    nextLogId: 0,
+    errorGrouping: {},
+    onlinePlayers: new Set(),
+    outputBuffers: { stdout: "", stderr: "" },
   };
   const child = spawn(command, args, {
     cwd: server.folderPath,
@@ -698,17 +789,30 @@ async function startServer(id, options = {}) {
   });
   runtime.process = child;
   runningServers.set(serverId, runtime);
+  try {
+    updateServerMetadata(server.folderPath, { lastStartedAt: runtime.startedAt });
+  } catch (error) {
+    appendLog(runtime, `[APP] Could not save the server start time: ${error.message}`);
+  }
   const configuredMemory = memorySettings(server);
   appendLog(runtime, `[APP] Starting ${server.name} with ${configuredMemory.minMemoryMb} MB minimum and ${configuredMemory.maxMemoryMb} MB maximum RAM...`);
 
-  const handleOutput = (chunk) => {
-    chunk.toString().split(/\r?\n/).forEach((line) => {
-      appendLog(runtime, line);
+  const handleOutput = (source) => (chunk) => {
+    const lines = `${runtime.outputBuffers[source]}${chunk.toString()}`.split(/\r?\n/);
+    runtime.outputBuffers[source] = lines.pop() || "";
+    lines.forEach((line) => {
+      appendLog(runtime, line, source);
       if (/Done \(.+\)! For help/i.test(line)) runtime.status = "running";
     });
   };
-  child.stdout.on("data", handleOutput);
-  child.stderr.on("data", handleOutput);
+  const flushOutput = () => {
+    for (const source of ["stdout", "stderr"]) {
+      if (runtime.outputBuffers[source]) appendLog(runtime, runtime.outputBuffers[source], source);
+      runtime.outputBuffers[source] = "";
+    }
+  };
+  child.stdout.on("data", handleOutput("stdout"));
+  child.stderr.on("data", handleOutput("stderr"));
   child.on("error", (error) => {
     runtime.status = "offline";
     runtime.stoppedAt = new Date().toISOString();
@@ -716,8 +820,9 @@ async function startServer(id, options = {}) {
     appendLog(runtime, `[APP] Start failed: ${error.message}`);
   });
   child.on("exit", (code) => {
+    flushOutput();
     runtime.status = "offline";
-    runtime.stoppedAt = new Date().toISOString();
+    runtime.stoppedAt ||= new Date().toISOString();
     runtime.exitCode = code;
     runtime.process = null;
     appendLog(runtime, `[APP] Server stopped (exit code ${code ?? "unknown"}).`);
@@ -758,7 +863,7 @@ function sendCommand(id, value) {
   if (!runtime?.process || runtime.status !== "running") throw new Error("Server is not running");
   if (!command) return runtimeSnapshot(serverId);
   runtime.process.stdin.write(`${command}\n`);
-  appendLog(runtime, `> ${command}`);
+  appendLog(runtime, `> ${command}`, "command");
   return runtimeSnapshot(serverId);
 }
 
@@ -774,7 +879,7 @@ async function waitForServerReady(id, timeoutMilliseconds = 240_000) {
     if (runtime?.status === "running") return runtimeSnapshot(serverId);
     if (!runtime || runtime.status === "offline") {
       const lastLine = runtime?.logs?.at(-1);
-      throw new Error(lastLine || "The server stopped before it finished starting");
+      throw new Error(lastLine?.raw || lastLine || "The server stopped before it finished starting");
     }
     await delay(250);
   }
@@ -889,21 +994,24 @@ function readAddonSearchCache() {
   }
 }
 
-async function searchAddonsWithCache(server, query, recommendations = false) {
+async function searchAddonsWithCache(server, query, recommendations = false, options = {}) {
   const normalizedQuery = String(query || "").trim().toLowerCase();
-  const key = `${server.type}:${server.version}:${recommendations ? "recommended" : normalizedQuery}`;
+  const releaseChannel = listServerAddons(server).releaseChannel;
+  const category = String(options.category || "all");
+  const sort = String(options.sort || "relevance");
+  const key = `${server.type}:${server.version}:${releaseChannel}:${recommendations ? "recommended-v2" : `${category}:${sort}:${normalizedQuery}`}`;
   const cache = readAddonSearchCache();
   try {
     const result = recommendations
       ? await recommendCompatibleAddons(server)
-      : await searchCompatibleAddons(server, query);
+      : await searchCompatibleAddons(server, query, { category, sort });
     cache[key] = { savedAt: new Date().toISOString(), result };
     const entries = Object.entries(cache).slice(-100);
     atomicWriteFile(addonSearchCachePath(), `${JSON.stringify(Object.fromEntries(entries), null, 2)}\n`);
-    return { ...result, cached: false, offline: false };
+    return { ...result, searchContract: 2, cached: false, offline: false };
   } catch (error) {
     if (cache[key]?.result) {
-      return { ...cache[key].result, cached: true, offline: true, offlineMessage: "Internet connection unavailable. Showing cached results." };
+      return { ...cache[key].result, searchContract: 2, cached: true, offline: true, offlineMessage: "Internet connection unavailable. Showing cached results." };
     }
     throw new Error(`Internet connection required to search add-ons. No files were changed. ${error.message}`);
   }
@@ -1281,6 +1389,25 @@ async function stopAllServers() {
   await Promise.all(ids.map((id) => stopServer(id)));
 }
 
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (tray && !tray.isDestroyed()) return;
+  tray = new Tray(getAssetPath("assets", "app-icon-32.png"));
+  tray.setToolTip(APP_NAME);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "Open BlockHost Manager", click: showMainWindow },
+    { type: "separator" },
+    { label: "Quit", click: () => requestApplicationQuit() },
+  ]));
+  tray.on("click", showMainWindow);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1180,
@@ -1304,6 +1431,14 @@ function createWindow() {
     },
   });
   mainWindow.removeMenu();
+  mainWindow.on("close", (event) => {
+    if (quitInProgress) return;
+    event.preventDefault();
+    mainWindow.hide();
+  });
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url === MINECRAFT_EULA_URL || url.startsWith("https://adoptium.net/")) {
@@ -1323,44 +1458,49 @@ function createWindow() {
   }
 }
 
-if (started) app.quit();
+const hasSingleInstanceLock = !started && app.requestSingleInstanceLock();
 
-app.whenReady().then(() => {
-  cleanupAbandonedTransfers(getServersRoot(), getExportsDirectory());
-  cleanupAbandonedAddonTransactions(getServersRoot());
-  cleanupAbandonedExternalImports(getServersRoot());
-  cleanupManagedJavaArtifacts(getManagedRuntimeRoot()).catch(() => {});
-  createWindow();
-  subscribeOperations((operations) => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("operations:state", operations);
-    finishQueuedQuit();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (app.isReady()) showMainWindow();
+    else app.whenReady().then(showMainWindow);
   });
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
 
-app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
-});
+  app.whenReady().then(() => {
+    cleanupAbandonedTransfers(getServersRoot(), getExportsDirectory());
+    cleanupAbandonedAddonTransactions(getServersRoot());
+    cleanupAbandonedExternalImports(getServersRoot());
+    cleanupManagedJavaArtifacts(getManagedRuntimeRoot()).catch(() => {});
+    createTray();
+    createWindow();
+    subscribeOperations((operations) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("operations:state", operations);
+      finishQueuedQuit();
+    });
+    app.on("activate", () => {
+      showMainWindow();
+    });
+  });
+}
 
 app.on("before-quit", (event) => {
   if (quitInProgress) return;
-  if (activeTransfers > 0 || getActiveOperations().length > 0) {
-    event.preventDefault();
-    quitAfterTransfers = true;
-    finishQueuedQuit();
-    return;
-  }
-  if (!runningEntry()) return;
   event.preventDefault();
-  quitInProgress = true;
-  stopAllServers().finally(() => app.quit());
+  requestApplicationQuit();
 });
 
 ipcMain.handle("servers:getVersionOptions", (_event, options) =>
   getVersionOptions(options?.type)
 );
+ipcMain.handle("app:copyText", (_event, value) => {
+  const text = String(value || "");
+  if (!text) throw new Error("There is no console output to copy");
+  if (Buffer.byteLength(text, "utf8") > 5 * 1024 * 1024) throw new Error("The selected console output is too large to copy at once");
+  clipboard.writeText(text);
+  return { copied: true, characters: text.length };
+});
 ipcMain.handle("dependencies:getJavaStatus", () => getJavaRuntimeStatus());
 ipcMain.handle("dependencies:installJava", (_event, javaVersion) => installJavaDependency(javaVersion));
 ipcMain.handle("servers:create", (_event, data) =>
@@ -1407,12 +1547,21 @@ ipcMain.handle("addons:recommendations", (_event, id) => {
 ipcMain.handle("addons:search", (_event, data) => {
   const server = getServer(data?.id);
   if (!server) throw new Error("Saved server not found");
-  return searchAddonsWithCache(server, data?.query);
+  return searchAddonsWithCache(server, data?.query, false, {
+    category: data?.category,
+    sort: data?.sort,
+  });
+});
+ipcMain.handle("addons:openProject", (_event, projectId) => {
+  const id = String(projectId || "");
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error("Invalid add-on project link");
+  return shell.openExternal(`https://modrinth.com/project/${encodeURIComponent(id)}`);
 });
 ipcMain.handle("addons:install", (_event, data) =>
   applyAddonChange(data?.id, "installing an add-on", (server) =>
     installModrinthAddon(server, {
       projectId: String(data?.projectId || ""),
+      versionId: String(data?.versionId || ""),
       title: String(data?.title || "Selected add-on"),
       iconUrl: String(data?.iconUrl || ""),
     })

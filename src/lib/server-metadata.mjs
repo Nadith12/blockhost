@@ -22,6 +22,8 @@ export function migrateServerMetadata(metadata, context = {}) {
     folderPath: _legacyFolderPath,
     jarPath: _legacyJarPath,
     typeLabel: _legacyTypeLabel,
+    lastStoppedAt: _unusedLastStoppedAt,
+    lastRunDurationMs: _unusedLastRunDurationMs,
     ...portableSource
   } = source;
   const launchType = source.launchType === "javaArgsFile" ? "javaArgsFile" : "jar";
@@ -48,6 +50,7 @@ export function migrateServerMetadata(metadata, context = {}) {
     maxMemoryMb: Number.isSafeInteger(Number(source.maxMemoryMb)) && Number(source.maxMemoryMb) >= 512
       ? Number(source.maxMemoryMb)
       : 0,
+    lastStartedAt: Number.isFinite(Date.parse(source.lastStartedAt)) ? String(source.lastStartedAt) : "",
   };
   return migrated;
 }
