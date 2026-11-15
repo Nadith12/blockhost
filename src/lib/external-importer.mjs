@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import yauzl from "yauzl";
+import { discardImportedAddonJournals } from "./addon-manager.mjs";
+import { LOADER_INSTALLER, START_SCRIPT, starterPackRoots } from "./drop-source.mjs";
 import { atomicWriteFile, assertPathInside } from "./safe-filesystem.mjs";
+import { normalizeServerIcon } from "./app-themes.mjs";
 
 const MAX_ENTRIES = 100_000;
 const MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024 * 1024;
@@ -12,6 +15,7 @@ const RATIO_MINIMUM_BYTES = 1024 * 1024;
 const EXTRA_DISK_BYTES = 64 * 1024 * 1024;
 const EXCLUDED_NAMES = new Set([
   ".blockhost-addon-backup",
+  ".blockhost-backup.json",
   ".blockhost-addon-staging",
   ".blockhost-import-staging",
   ".blockhost-transfer-staging",
@@ -72,7 +76,7 @@ function portableEntryPath(value) {
   const directory = text.endsWith("/");
   const parts = text.split("/");
   if (directory) parts.pop();
-  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) throw new Error("The ZIP contains an unsafe traversal path");
+  if (!parts.length || parts.some((part) => !part || part === "." || part === ".." || /[<>:"|?*\x00-\x1f]|[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) throw new Error("The ZIP contains an unsafe traversal path");
   return `${parts.join("/")}${directory ? "/" : ""}`;
 }
 
@@ -89,7 +93,7 @@ function openEntryStream(zip, entry) {
   return new Promise((resolve, reject) => zip.openReadStream(entry, (error, stream) => error ? reject(error) : resolve(stream)));
 }
 
-async function extractZip(source, destination, onProgress) {
+async function extractZip(source, destination, onProgress, signal) {
   const zip = await openZip(source);
   let entries = 0;
   let uncompressed = 0;
@@ -111,6 +115,7 @@ async function extractZip(source, destination, onProgress) {
     });
     zip.on("entry", (entry) => {
       Promise.resolve().then(async () => {
+        signal?.throwIfAborted();
         entries += 1;
         if (entries > MAX_ENTRIES) throw new Error("The server ZIP contains too many files");
         const entryPath = portableEntryPath(entry.fileName);
@@ -129,7 +134,7 @@ async function extractZip(source, destination, onProgress) {
         if (entryPath.endsWith("/")) fs.mkdirSync(output, { recursive: true });
         else {
           fs.mkdirSync(path.dirname(output), { recursive: true });
-          await pipeline(await openEntryStream(zip, entry), fs.createWriteStream(output, { flags: "wx" }));
+          await pipeline(await openEntryStream(zip, entry), fs.createWriteStream(output, { flags: "wx" }), { signal });
         }
         progress(onProgress, "extract", Math.min(65, 10 + entries / 20), `Extracting server files… (${entries})`);
       }).then(() => zip.readEntry()).catch(fail);
@@ -296,9 +301,15 @@ export function detectExternalServer(serverRoot) {
   const topLevelJars = files.filter((value) => !value.includes("/") && /\.jar$/i.test(value) && !/installer|sources|javadoc/i.test(value));
   const fabricJars = topLevelJars.filter((value) => /fabric.*server|fabric-server|fabric-loader/i.test(value));
   const paperJars = topLevelJars.filter((value) => /paper/i.test(value));
+  const quiltJar = topLevelJars.find(value => /^quilt-server-launch\.jar$/i.test(value));
+  const purpurJar = topLevelJars.find(value => /^purpur(?:[-_.]|\.jar$)/i.test(value));
+  const forgeJar = topLevelJars.find(value => /^forge-1\.\d+(?:\.\d+)?-[\d.]+(?:-universal)?\.jar$/i.test(value));
   let candidates = topLevelJars;
   let type = "vanilla";
-  if (fabricJars.length === 1) {
+  if (quiltJar || purpurJar || forgeJar) {
+    candidates = [quiltJar || purpurJar || forgeJar];
+    type = quiltJar ? "quilt" : purpurJar ? "purpur" : "forge";
+  } else if (fabricJars.length === 1) {
     candidates = fabricJars;
     type = "fabric";
   } else if (fabricJars.length > 1) throw new Error(`Multiple Fabric launch JARs were found: ${fabricJars.join(", ")}`);
@@ -314,7 +325,7 @@ export function detectExternalServer(serverRoot) {
   }
   return {
     type,
-    version: inferVersion([candidates[0], ...lowerFiles]),
+    version: inferVersion([candidates[0], ...lowerFiles.filter(value => /(?:minecraft|versions\/|hashed\/|intermediary\/)/i.test(value)), ...lowerFiles]),
     loaderVersion: type === "fabric" ? inferVersion(lowerFiles.filter((value) => value.includes("fabric-loader"))) : "",
     launchType: "jar",
     launchArgsPath: "",
@@ -322,9 +333,11 @@ export function detectExternalServer(serverRoot) {
   };
 }
 
-async function renameWithRetries(source, destination) {
+async function renameWithRetries(source, destination, signal) {
   let lastError;
   for (let attempt = 0; attempt < 12; attempt += 1) {
+    signal?.throwIfAborted();
+    if (fs.existsSync(destination)) throw new Error("The imported server destination already exists");
     try {
       fs.renameSync(source, destination);
       return;
@@ -335,6 +348,120 @@ async function renameWithRetries(source, destination) {
     }
   }
   throw lastError;
+}
+
+function readPackSettings(root, file) {
+  const source = path.join(root, file);
+  if (fs.statSync(source).size > 1024 * 1024) throw new Error("Server pack settings are too large.");
+  return fs.readFileSync(source, "utf8");
+}
+
+function starterAssignments(text) {
+  const values = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.trim().match(/^(?:(?:export|set)\s+)?"?([a-z_][\w]*)\s*=\s*(.*?)"?$/i);
+    if (!match) continue;
+    const key = match[1].toUpperCase();
+    const value = match[2].replace(/^["\x27]|["\x27]$/g, "");
+    values.set(key, values.has(key) && values.get(key) !== value ? "" : value);
+  }
+  return values;
+}
+
+function pinnedStarter(type, version, loaderVersion) {
+  if (!["forge", "neoforge", "fabric", "quilt"].includes(type)) throw new Error("This server pack needs a supported loader: Forge, NeoForge, Fabric, or Quilt.");
+  if (!/^\d+(?:\.\d+){1,2}$/.test(version || "") || !/^\d+(?:\.\d+){1,4}(?:-[\da-z.]+)?$/i.test(loaderVersion || "")) {
+    throw new Error("This server pack must pin both Minecraft and its loader to a specific version.");
+  }
+  if (type === "forge") {
+    if (!loaderVersion.startsWith(version + "-")) loaderVersion = version + "-" + loaderVersion;
+  }
+  return { type, version, loaderVersion };
+}
+
+function readStarterVersions(root) {
+  const names = new Map(fs.readdirSync(root).map(name => [name.toLowerCase(), name]));
+  if (names.has("variables.txt")) {
+    const settings = starterAssignments(readPackSettings(root, names.get("variables.txt")));
+    if (settings.has("MODLOADER")) return { ...pinnedStarter(settings.get("MODLOADER").toLowerCase(), settings.get("MINECRAFT_VERSION"), settings.get("MODLOADER_VERSION")), recommendedJavaMajor: Number(settings.get("RECOMMENDED_JAVA_VERSION")) || undefined };
+  }
+  if (names.has("settings.cfg")) {
+    const settings = starterAssignments(readPackSettings(root, names.get("settings.cfg")));
+    if (settings.has("MCVER") || settings.has("FORGEVER")) return pinnedStarter("forge", settings.get("MCVER"), settings.get("FORGEVER"));
+  }
+  const candidates = [];
+  for (const name of names.keys()) {
+    if (START_SCRIPT.test(name)) {
+      const settings = starterAssignments(readPackSettings(root, names.get(name)));
+      for (const [key, type] of [["FORGE_VERSION", "forge"], ["NEOFORGE_VERSION", "neoforge"]]) {
+        if (settings.get(key) && settings.get("MINECRAFT_VERSION")) candidates.push(pinnedStarter(type, settings.get("MINECRAFT_VERSION"), settings.get(key)));
+      }
+    }
+    const installer = name.match(LOADER_INSTALLER);
+    if (!installer) continue;
+    const [, type, release] = installer;
+    if (type === "forge") {
+      const separator = release.indexOf("-");
+      if (separator > 0) candidates.push(pinnedStarter(type, release.slice(0, separator), release.slice(separator + 1)));
+    } else {
+      const match = release.match(/^(20|21)\.(\d+)\.\d+(?:-[\da-z.]+)?$/i);
+      if (match) candidates.push(pinnedStarter(type, "1." + match[1] + (match[2] === "0" ? "" : "." + match[2]), release));
+    }
+  }
+  const unique = new Map(candidates.map(pack => [JSON.stringify(pack), pack]));
+  if (unique.size > 1) throw new Error("This server pack declares conflicting loader versions. Import a prepared server folder with one installed loader.");
+  if (unique.size === 1) return unique.values().next().value;
+  if (names.has("manifest.json")) {
+    const text = readPackSettings(root, names.get("manifest.json"));
+    let manifest;
+    try { manifest = JSON.parse(text.replace(/^\uFEFF/, "")); } catch {}
+    if (manifest?.manifestType === "minecraftModpack" && manifest.manifestVersion === 1 && Array.isArray(manifest.minecraft?.modLoaders)) {
+      const primary = manifest.minecraft.modLoaders.filter(loader => loader?.primary === true);
+      const loader = primary.length === 1 ? primary[0].id : undefined;
+      const match = typeof loader === "string" && loader.match(/^(forge|neoforge|fabric|quilt)-(.+)$/);
+      if (match) return pinnedStarter(match[1], manifest.minecraft.version, match[2]);
+    }
+  }
+  throw new Error("BlockHost could not determine the loader version for this server pack. Set it up with the author’s installer, then import the installed server folder.");
+}
+
+function publisherLauncher(root) {
+  // Read the version assignments when available. Their scripts are never run.
+  const names = new Set(fs.readdirSync(root).map(name => name.toLowerCase()));
+  if (names.has("variables.txt") || names.has("settings.cfg") || names.has("manifest.json")) {
+    try { return readStarterVersions(root); } catch {}
+  }
+  const detected = detectExternalServer(root);
+  if (detected.type === "forge") {
+    const match = (detected.loaderVersion || detected.jarFile).match(/^(?:forge-)?(1\.\d+(?:\.\d+)?)-(\d+(?:\.\d+){1,4})(?:-universal\.jar|\.jar)?$/i);
+    if (match) return pinnedStarter("forge", match[1], match[2]);
+  }
+  if (detected.type === "neoforge") {
+    const match = detected.loaderVersion.match(/^(20|21)\.(\d+)\.\d+(?:-[\da-z.]+)?$/i);
+    if (match) return pinnedStarter("neoforge", "1." + match[1] + (match[2] === "0" ? "" : "." + match[2]), detected.loaderVersion);
+  }
+  if (detected.type === "fabric") {
+    const match = detected.jarFile.match(/^fabric-server-mc\.(1\.\d+(?:\.\d+)?)-loader\.(\d+(?:\.\d+){1,4})-launcher\.[\w.-]+\.jar$/i);
+    if (match) return pinnedStarter("fabric", match[1], match[2]);
+  }
+  throw new Error("The publisher archive does not identify an exact Minecraft and loader version. Choose another release, or import a server folder prepared with the publisher’s installer.");
+}
+
+export async function inspectExternalServerZip(source, destination, { starter = false, rebuildLauncher = false, signal } = {}) {
+  fs.mkdirSync(destination, { recursive: false });
+  const expectedBytes = await measureZip(source);
+  assertDiskSpace(destination, expectedBytes);
+  const totalBytes = await extractZip(source, destination, undefined, signal);
+  let serverRoot = findServerRoot(destination);
+  if (starter) {
+    const roots = starterPackRoots(collectRelativeFiles(destination));
+    if (roots.length !== 1) throw new Error("Choose a ZIP containing one server pack.");
+    serverRoot = assertPathInside(destination, path.join(destination, roots[0]), { allowRoot: true });
+  }
+  const detected = starter ? readStarterVersions(serverRoot)
+    : rebuildLauncher ? publisherLauncher(serverRoot) : detectExternalServer(serverRoot);
+  const files = collectRelativeFiles(serverRoot);
+  return { ...detected, sourceFolder: serverRoot, totalBytes, fileCount: files.length, hasWorld: files.some(name => /(^|\/)level\.dat$/i.test(name)) };
 }
 
 export async function importExternalServer(sourcePath, serversRoot, existingServers = [], options = {}) {
@@ -350,16 +477,21 @@ export async function importExternalServer(sourcePath, serversRoot, existingServ
   const staging = assertPathInside(stagingParent, path.join(stagingParent, crypto.randomUUID()));
   const extracted = path.join(staging, "source");
   let destination = "";
+  let published = false;
   try {
+    options.signal?.throwIfAborted();
     const expectedBytes = stats.isDirectory() ? measureDirectory(source) : await measureZip(source);
     assertDiskSpace(root, expectedBytes);
     fs.mkdirSync(extracted, { recursive: true });
     progress(options.onProgress, "inspect", 3, "Inspecting the external server…");
     const totalBytes = stats.isDirectory()
       ? copyDirectory(source, extracted, options.onProgress)
-      : await extractZip(source, extracted, options.onProgress);
+      : await extractZip(source, extracted, options.onProgress, options.signal);
+    options.signal?.throwIfAborted();
     const serverRoot = findServerRoot(extracted);
     const detected = detectExternalServer(serverRoot);
+    discardImportedAddonJournals(serverRoot);
+    await options.beforeCommit?.(serverRoot);
     const requestedName = options.name || path.basename(source, path.extname(source));
     const name = chooseName(requestedName, existingServers);
     const id = nextId(root, existingServers);
@@ -373,7 +505,9 @@ export async function importExternalServer(sourcePath, serversRoot, existingServ
       type: detected.type,
       version: detected.version,
       loaderVersion: detected.loaderVersion,
-      color: "#39c9ff",
+      color: /^#[a-f0-9]{6}$/i.test(options.color || "") ? options.color : "#39c9ff",
+      icon: normalizeServerIcon(options.icon),
+      ...(options.modpack ? { modpack: options.modpack } : {}),
       launchType: detected.launchType,
       jarFile: detected.jarFile,
       launchArgsPath: detected.launchArgsPath,
@@ -383,15 +517,18 @@ export async function importExternalServer(sourcePath, serversRoot, existingServ
       importedAt: now,
       importSource: "external",
     };
-    atomicWriteFile(path.join(serverRoot, "server-info.json"), `${JSON.stringify(metadata, null, 2)}\n`);
     const eula = path.join(serverRoot, "eula.txt");
     if (fs.existsSync(eula)) fs.rmSync(eula, { force: true });
+    fs.rmSync(path.join(serverRoot, ".blockhost-backup.json"), { force: true });
+    Object.assign(metadata, await options.prepareMetadata?.(serverRoot, metadata));
+    atomicWriteFile(path.join(serverRoot, "server-info.json"), `${JSON.stringify(metadata, null, 2)}\n`);
     progress(options.onProgress, "commit", 92, "Adding the detected server to BlockHost…");
-    await renameWithRetries(serverRoot, destination);
+    await renameWithRetries(serverRoot, destination, options.signal);
+    published = true;
     progress(options.onProgress, "complete", 100, "External server import complete.");
     return { server: metadata, path: destination, totalBytes, detected };
   } catch (error) {
-    if (destination && fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+    if (published && fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
     throw error;
   } finally {
     if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });

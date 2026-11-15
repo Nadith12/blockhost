@@ -177,7 +177,9 @@ export function parseProperties(text = "") {
   for (let index = 0; index < lines.length; index += 1) {
     const rawLines = [lines[index]];
     let logical = lines[index];
-    while (hasOddTrailingBackslashes(logical) && index + 1 < lines.length) {
+    // Java Properties treats a comment as a single physical line, even if it ends in a backslash.
+    const comment = /^[ \t\f]*[#!]/.test(logical);
+    while (!comment && hasOddTrailingBackslashes(logical) && index + 1 < lines.length) {
       logical = `${logical.slice(0, -1)}${lines[index + 1].trimStart()}`;
       index += 1;
       rawLines.push(lines[index]);
@@ -222,6 +224,28 @@ export function serializeProperties(parsed, updates, removeKeys = new Set()) {
     missing.forEach(([key, value]) => output.push(`${encodeProperty(key, true)}=${encodeProperty(value)}`));
   }
   return `${output.join("\n").replace(/\n+$/g, "")}\n`;
+}
+
+export function buildInitialServerProperties(existingText = "", seedValue = "", quickDefaults = {}, version = "unknown", {
+  preserveAccess = false, publisherPack = false,
+} = {}) {
+  const seed = String(seedValue || "").trim();
+  if (seed.length > 200 || /[\r\n\0]/.test(seed)) {
+    throw new Error("World seed must be one line and no more than 200 characters");
+  }
+  return serializeProperties(parseProperties(existingText || "# Minecraft server properties\n"), {
+    ...validatePropertyValues(quickDefaults, propertySchemaForVersion(version).filter(field => Object.hasOwn(quickDefaults, field.key))),
+    ...(preserveAccess ? {} : { "white-list": "false", "enforce-whitelist": "false" }),
+    ...(publisherPack ? {
+      "online-mode": true,
+      "enable-rcon": false,
+      "enable-query": false,
+      "enable-jmx-monitoring": false,
+      "management-server-enabled": false,
+      "rcon.password": "",
+    } : {}),
+    ...(seed ? { "level-seed": seed } : {}),
+  });
 }
 
 function normalizeValue(property, rawValue) {

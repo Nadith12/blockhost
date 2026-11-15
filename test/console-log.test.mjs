@@ -24,6 +24,23 @@ test("console parser groups an error and its Java stack trace", () => {
   assert.equal(frame.errorGroupId, error.errorGroupId);
 });
 
+test("Fabric dependency details stay in one copyable error group", () => {
+  const state = {};
+  const entries = [
+    "[22:08:47] [main/ERROR]: Incompatible mods found!",
+    "net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible",
+    "A potential solution has been determined, this may resolve your problem:",
+    "\t - Install iris, version 1.7.0 or later.",
+    "More details:",
+    "\t - Mod Colorwheel requires iris, which is missing!",
+    "\tat net.fabricmc.loader.impl.FabricLoaderImpl.load(FabricLoaderImpl.java:202)",
+  ].map(line => attachErrorGroup(parseConsoleLine(line), state));
+  assert.ok(entries[0].errorGroupId);
+  assert.ok(entries.every(entry => entry.level === "error" && entry.errorGroupId === entries[0].errorGroupId));
+  const next = attachErrorGroup(parseConsoleLine("[22:08:48] [main/INFO]: Another message"), state);
+  assert.equal(next.errorGroupId, "");
+});
+
 test("console parser strips terminal formatting and recognises commands", () => {
   assert.equal(parseConsoleLine("\u001b[31m[APP] Start failed: bad Java\u001b[0m").level, "error");
   const command = parseConsoleLine("> list");

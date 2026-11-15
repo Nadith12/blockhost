@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import net from "node:net";
 import test from "node:test";
-import { probeServerPort, serverEndpoint } from "../src/lib/server-port.mjs";
+import { probeServerPort, serverEndpoint, serverJoinAddress, serverPortIsListening } from "../src/lib/server-port.mjs";
 
 test("server endpoint uses Minecraft defaults and accepts configured values", () => {
   assert.deepEqual(serverEndpoint({}), {
@@ -16,6 +16,12 @@ test("server endpoint uses Minecraft defaults and accepts configured values", ()
   });
 });
 
+test("the local join address uses the running server’s bind address and port", () => {
+  assert.equal(serverJoinAddress(serverEndpoint({})), "localhost");
+  assert.equal(serverJoinAddress(serverEndpoint({ "server-port": 25570, "server-ip": "127.0.0.1" })), "127.0.0.1:25570");
+  assert.equal(serverJoinAddress(serverEndpoint({ "server-port": 25570, "server-ip": "::" })), "[::1]:25570");
+});
+
 test("port probe detects an external listener and succeeds after it closes", async () => {
   const listener = net.createServer();
   await new Promise((resolve, reject) => {
@@ -27,8 +33,10 @@ test("port probe detects an external listener and succeeds after it closes", asy
   const occupied = await probeServerPort({ port, host: "127.0.0.1" });
   assert.equal(occupied.available, false);
   assert.equal(occupied.code, "EADDRINUSE");
+  assert.equal(await serverPortIsListening({ port, host: "0.0.0.0" }), true);
 
   await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
   const available = await probeServerPort({ port, host: "127.0.0.1" });
   assert.equal(available.available, true);
+  assert.equal(await serverPortIsListening({ port, host: "127.0.0.1" }), false);
 });

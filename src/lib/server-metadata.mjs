@@ -1,6 +1,9 @@
+import { javaRequirement } from "./java-runtime.mjs";
+import { normalizeServerIcon } from "./app-themes.mjs";
+
 export const CURRENT_SERVER_SCHEMA_VERSION = 3;
 
-const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
+const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge", "quilt", "purpur"]);
 const DEFAULT_COLOR = "#39c9ff";
 
 function normalizeType(value) {
@@ -36,6 +39,7 @@ export function migrateServerMetadata(metadata, context = {}) {
     version: String(source.version || "unknown"),
     loaderVersion: String(source.loaderVersion || ""),
     color: normalizeColor(source.color),
+    icon: normalizeServerIcon(source.icon),
     launchType,
     jarFile: launchType === "jar" ? String(source.jarFile || "server.jar") : "",
     launchArgsPath: String(source.launchArgsPath || ""),
@@ -52,6 +56,7 @@ export function migrateServerMetadata(metadata, context = {}) {
       : 0,
     lastStartedAt: Number.isFinite(Date.parse(source.lastStartedAt)) ? String(source.lastStartedAt) : "",
   };
+  migrated.java ||= { requiredMajor: javaRequirement(migrated).requiredMajor, selectionMode: "automatic" };
   return migrated;
 }
 

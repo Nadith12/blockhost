@@ -9,7 +9,7 @@ import { assertPathInside } from "./safe-filesystem.mjs";
 const MAX_ARCHIVE_BYTES = 500 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 const MAX_ENTRIES = 50_000;
-const DOWNLOAD_HOSTS = new Set(["github.com", "api.adoptium.net"]);
+const DOWNLOAD_HOSTS = new Set(["github.com", "api.adoptium.net", "cdn.azul.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]);
 const READY_MARKER = ".blockhost-java-ready";
 
 function emitProgress(listener, stage, percent, message) {
@@ -24,7 +24,7 @@ function safeEntryPath(value) {
   const directory = text.endsWith("/");
   const parts = text.split("/");
   if (directory) parts.pop();
-  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) {
+  if (!parts.length || parts.some((part) => !part || part === "." || part === ".." || /[<>:"|?*\x00-\x1f]|[. ]$/.test(part))) {
     throw new Error("The Java archive contains an unsafe traversal path");
   }
   return `${parts.join("/")}${directory ? "/" : ""}`;
@@ -111,8 +111,20 @@ export function isManagedJavaReady(rootPath) {
 }
 
 async function getPackageMetadata(javaVersion, fetchImpl) {
+  if (javaVersion === 16) {
+    const url = "https://api.azul.com/metadata/v1/zulu/packages/?java_version=16&os=windows&arch=x64&archive_type=zip&java_package_type=jdk&javafx_bundled=false&availability_types=CA&release_status=ga&latest=true&include_fields=sha256_hash&page_size=1";
+    const response = await fetchImpl(url, { signal: AbortSignal.timeout(30_000) });
+    if (!response.ok) throw new Error("Java 16 provider returned HTTP " + response.status);
+    const [asset] = await response.json();
+    const link = new URL(asset?.download_url || "https://invalid.invalid");
+    if (link.protocol !== "https:" || link.hostname !== "cdn.azul.com" || !/^[0-9a-f]{64}$/i.test(asset?.sha256_hash || "")) {
+      throw new Error("The Java 16 provider did not supply a verified Windows x64 archive.");
+    }
+    return { link: link.href, checksum: asset.sha256_hash.toLowerCase(), size: 0 };
+  }
   const assetsUrl = `https://api.adoptium.net/v3/assets/latest/${javaVersion}/hotspot?architecture=x64&heap_size=normal&image_type=jre&jvm_impl=hotspot&os=windows&page=0&page_size=1&project=jdk&release_type=ga&sort_method=DEFAULT&sort_order=DESC&vendor=eclipse`;
   const response = await fetchImpl(assetsUrl, {
+    signal: AbortSignal.timeout(30_000),
     headers: { Accept: "application/json", "User-Agent": "BlockHostManager/1.0.6" },
   });
   if (!response.ok) throw new Error(`Java provider returned HTTP ${response.status}`);
@@ -129,58 +141,73 @@ async function getPackageMetadata(javaVersion, fetchImpl) {
   return { link, checksum, size };
 }
 
-async function downloadPackage(packageInfo, destination, fetchImpl, onProgress) {
-  const response = await fetchImpl(packageInfo.link, { headers: { "User-Agent": "BlockHostManager/1.0.6" } });
+async function downloadPackage(packageInfo, destination, fetchImpl, onProgress, javaVersion) {
+  let url = new URL(packageInfo.link);
+  const signal = AbortSignal.timeout(10 * 60_000);
+  let response;
+  for (let redirects = 0; redirects < 5; redirects++) {
+    if (url.protocol !== "https:" || !DOWNLOAD_HOSTS.has(url.hostname) || url.username || url.password || url.port) {
+      throw new Error("Java download redirected to an untrusted address.");
+    }
+    response = await fetchImpl(url.href, { redirect: "manual", signal, headers: { "User-Agent": "BlockHostManager/1.0.6" } });
+    if (response.status < 300 || response.status >= 400) break;
+    const location = response.headers.get("location");
+    await response.body?.cancel();
+    if (!location) throw new Error("Java download redirect is missing its destination.");
+    url = new URL(location, url);
+  }
   if (!response.ok || !response.body) throw new Error(`Java download failed with HTTP ${response.status}`);
   const hash = crypto.createHash("sha256");
   let received = 0;
   const meter = new Transform({
     transform(chunk, _encoding, callback) {
       received += chunk.length;
-      if (received > MAX_ARCHIVE_BYTES || received > packageInfo.size) return callback(new Error("Java download exceeded its published size"));
+      if (received > MAX_ARCHIVE_BYTES || (packageInfo.size && received > packageInfo.size)) return callback(new Error("Java download exceeded its published size"));
       hash.update(chunk);
-      emitProgress(onProgress, "download", 5 + (received / packageInfo.size) * 60, `Downloading Java 21… ${Math.floor(received / 1024 / 1024)} MB`);
+      emitProgress(onProgress, "download", packageInfo.size ? 5 + (received / packageInfo.size) * 60 : 5, "Downloading Java " + javaVersion + "… " + Math.floor(received / 1024 / 1024) + " MB");
       callback(null, chunk);
     },
   });
   const input = typeof response.body.getReader === "function" ? Readable.fromWeb(response.body) : response.body;
   await pipeline(input, meter, fs.createWriteStream(destination, { flags: "wx" }));
-  if (received !== packageInfo.size) throw new Error("Java download size did not match the provider metadata");
+  if (packageInfo.size && received !== packageInfo.size) throw new Error("Java download size did not match the provider metadata");
   if (hash.digest("hex") !== packageInfo.checksum) throw new Error("Java download failed SHA-256 verification");
 }
 
 export async function installManagedJava(options) {
   const javaVersion = Number(options.javaVersion || 25);
-  if (![21, 25].includes(javaVersion)) throw new Error("BlockHost cannot automatically install that Java version");
+  if (!Number.isSafeInteger(javaVersion) || javaVersion < 8 || javaVersion > 99) throw new Error("BlockHost cannot automatically install that Java version");
   const runtimeRoot = path.resolve(options.runtimeRoot);
   const destination = assertPathInside(runtimeRoot, path.join(runtimeRoot, `java-${javaVersion}`));
   const archive = assertPathInside(runtimeRoot, path.join(runtimeRoot, `.java-download-${crypto.randomUUID()}.zip`));
+  const staging = assertPathInside(runtimeRoot, path.join(runtimeRoot, ".java-install-" + crypto.randomUUID()));
+  const payload = path.join(staging, "runtime");
+  const previous = path.join(staging, "previous");
   const fetchImpl = options.fetchImpl || fetch;
   fs.mkdirSync(runtimeRoot, { recursive: true });
   try {
     emitProgress(options.onProgress, "metadata", 2, `Finding the official Java ${javaVersion} package…`);
     const packageInfo = await getPackageMetadata(javaVersion, fetchImpl);
-    await downloadPackage(packageInfo, archive, fetchImpl, (progress) => options.onProgress?.({
-      ...progress,
-      message: progress.stage === "download" ? progress.message.replace("Java 21", `Java ${javaVersion}`) : progress.message,
-    }));
-    if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
-    fs.mkdirSync(destination, { recursive: true });
-    try {
-      await extractRuntime(archive, destination, options.onProgress);
-      const executable = findJavaExecutable(destination, "win32");
-      if (!executable) throw new Error("The downloaded package did not contain Java");
-      emitProgress(options.onProgress, "validate", 95, "Checking the Java runtime…");
-      const validation = await options.validateJava?.(executable);
-      fs.writeFileSync(path.join(destination, READY_MARKER), `BlockHost managed Java ${javaVersion}\n`, { encoding: "utf8", flag: "wx" });
-      emitProgress(options.onProgress, "finalize", 98, "Finishing Java setup…");
-      return { executable, destination, javaVersion, packageSize: packageInfo.size, details: validation?.details || null };
-    } catch (error) {
-      if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+    const disk = await fs.promises.statfs(runtimeRoot).catch(() => null);
+    if (disk && disk.bavail * disk.bsize < packageInfo.size + MAX_EXTRACTED_BYTES) throw new Error("Not enough free disk space to install Java.");
+    await downloadPackage(packageInfo, archive, fetchImpl, options.onProgress, javaVersion);
+    fs.mkdirSync(payload, { recursive: true });
+    await extractRuntime(archive, payload, options.onProgress);
+    const executable = findJavaExecutable(payload, "win32");
+    if (!executable) throw new Error("The downloaded package did not contain Java");
+    emitProgress(options.onProgress, "validate", 95, "Checking the Java runtime…");
+    const validation = await options.validateJava?.(executable);
+    fs.writeFileSync(path.join(payload, READY_MARKER), "BlockHost managed Java " + javaVersion + "\n", { encoding: "utf8", flag: "wx" });
+    if (fs.existsSync(destination)) fs.renameSync(destination, previous);
+    try { fs.renameSync(payload, destination); } catch (error) {
+      if (fs.existsSync(previous)) fs.renameSync(previous, destination);
       throw error;
     }
+    emitProgress(options.onProgress, "finalize", 98, "Finishing Java setup…");
+    return { executable: path.join(destination, path.relative(payload, executable)), destination, javaVersion, packageSize: packageInfo.size, details: validation?.details || null };
   } finally {
     if (fs.existsSync(archive)) fs.rmSync(archive, { force: true });
+    if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
   }
 }
 

@@ -42,9 +42,34 @@ export function assertSupportedJavaRuntime(details, minimumMajor = 21) {
   return details;
 }
 
-export function requiredJavaVersion(minecraftVersion) {
+export function requiredJavaVersion(minecraftVersion, type = "") {
   const value = String(minecraftVersion || "").trim();
   const modern = value.match(/^(\d{2,})(?:\.|$)/);
   if (modern && Number(modern[1]) >= 26) return 25;
-  return 21;
+  const release = value.match(/^1\.(\d+)(?:\.(\d+))?(?:$|[-+])/);
+  if (!release) return 21;
+  const minor = Number(release[1]);
+  const patch = Number(release[2] || 0);
+  if (type === "paper" || type === "purpur") {
+    if (minor >= 20) return 21;
+    if (minor >= 17) return 17;
+    if (minor === 16 && patch >= 5) return 16;
+    if (minor >= 12) return 11;
+  }
+  if (minor >= 21 || (minor === 20 && patch >= 5)) return 21;
+  if (minor >= 18) return 17;
+  if (minor === 17) return 16;
+  return 8;
+}
+
+export function javaRequirement(server) {
+  const baseline = requiredJavaVersion(server.version, server.type);
+  const official = Number(server.minecraftJavaMajor);
+  const hasOfficial = Number.isSafeInteger(official) && official >= 8 && official <= 99;
+  const minimum = hasOfficial && server.type === "vanilla" ? official : baseline;
+  const recommendation = Number(server.recommendedJavaMajor);
+  const hasRecommendation = Number.isSafeInteger(recommendation) && recommendation >= minimum && recommendation <= 99;
+  const requiredMajor = hasRecommendation ? recommendation : minimum;
+  const knownVersion = /^(?:1\.\d+(?:\.\d+)?|(?:2[6-9]|[3-9]\d)\.\d+)(?:$|[.-])/.test(String(server.version || ""));
+  return { requiredMajor, warning: knownVersion || hasOfficial || hasRecommendation ? "" : "Minecraft version could not be determined. Java " + requiredMajor + " is the suggested runtime." };
 }

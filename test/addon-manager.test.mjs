@@ -5,18 +5,25 @@ import path from "node:path";
 import test from "node:test";
 import yazl from "yazl";
 import {
+  cleanupAbandonedAddonTransactions,
   commitAddonTransaction,
+  describeLocalInstalledAddons,
+  findBundledPackDependency,
   getAddonProfile,
+  identifyInstalledAddons,
   installManualAddon,
   installModrinthAddon,
   inspectAddonJar,
   listServerAddons,
+  recordModpackInventory,
   removeAddon,
   rollbackAddonTransaction,
+  scanServerAddons,
   searchCompatibleAddons,
   recommendCompatibleAddons,
   setAddonEnabled,
 } from "../src/lib/addon-manager.mjs";
+import { clientModList } from "../src/lib/addon-sides.mjs";
 
 function fixture(type = "fabric") {
   const folderPath = fs.mkdtempSync(path.join(process.cwd(), ".test-tmp-addons-"));
@@ -34,6 +41,48 @@ function jarBuffer(label) {
 function validEmptyJar() {
   return Buffer.from("UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==", "base64");
 }
+
+test("previously installed CurseForge mods retain local dependency controls", t => {
+  const { folderPath, server, cleanup } = fixture();
+  t.after(cleanup);
+  const mods = path.join(folderPath, "mods");
+  fs.mkdirSync(mods);
+  for (const fileName of ["base.jar", "extension.jar"]) {
+    fs.writeFileSync(path.join(mods, fileName), validEmptyJar());
+  }
+  fs.writeFileSync(path.join(folderPath, "addons-lock.json"), JSON.stringify({ entries: [
+    { id: "curseforge:10", source: "curseforge", projectId: "10", fileName: "base.jar" },
+    { id: "curseforge:11", source: "curseforge", projectId: "11", fileName: "extension.jar", dependencies: ["curseforge:10"] },
+  ] }));
+  const listing = listServerAddons(server);
+  assert.deepEqual(listing.items.find(item => item.id === "curseforge:10").dependents.map(item => item.id), ["curseforge:11"]);
+  const change = setAddonEnabled(server, "curseforge:10", false, { cascade: true });
+  commitAddonTransaction(change.transaction);
+  assert.equal(listServerAddons(server).items.every(item => !item.enabled), true);
+});
+
+test("abandoned add-on recovery rejects paths outside the server and restores a valid toggle", t => {
+  const { folderPath, server, cleanup } = fixture();
+  t.after(cleanup);
+  const serversRoot = path.join(folderPath, "servers");
+  server.folderPath = path.join(serversRoot, "pack");
+  const mods = path.join(server.folderPath, "mods");
+  fs.mkdirSync(mods, { recursive: true });
+  const jar = path.join(mods, "bundled.jar");
+  const outside = path.join(folderPath, "outside.jar");
+  fs.writeFileSync(jar, validEmptyJar());
+  fs.writeFileSync(outside, "untouched");
+  const addon = listServerAddons(server).items[0];
+  setAddonEnabled(server, addon.id, false);
+  const id = crypto.randomUUID();
+  fs.writeFileSync(path.join(server.folderPath, `.blockhost-addon-journal-${id}.json`), JSON.stringify({
+    id, previousLockExisted: false, previousLockText: "", newFiles: [outside], renames: [], backups: [],
+  }));
+  assert.deepEqual(cleanupAbandonedAddonTransactions(serversRoot), [server.folderPath]);
+  assert.equal(fs.readFileSync(outside, "utf8"), "untouched");
+  assert.equal(fs.existsSync(jar), true);
+  assert.equal(fs.existsSync(jar + ".disabled"), false);
+});
 
 function createJar(filePath, entries) {
   return new Promise((resolve, reject) => {
@@ -86,6 +135,181 @@ test("add-on profiles distinguish mods, Paper plugins, and unsupported Vanilla",
   assert.deepEqual(getAddonProfile({ type: "paper" }).kind, "plugins");
   assert.equal(getAddonProfile({ type: "neoforge" }).loader, "neoforge");
   assert.equal(getAddonProfile({ type: "vanilla" }).supported, false);
+});
+
+test("a repair can identify one disabled publisher JAR from loader metadata", async t => {
+  const { server, folderPath, cleanup } = fixture();
+  t.after(cleanup);
+  server.modpack = { name: "Bundled pack", version: "1" };
+  server.modpackSetup = { status: "repair", diagnosis: {
+    kind: "dependency", requirements: [{ kind: "missing", modId: "modmenu", version: "any version" }],
+  } };
+  const mods = path.join(folderPath, "mods");
+  fs.mkdirSync(mods);
+  const mod = (id, version, name = id) => [["fabric.mod.json", JSON.stringify({ id, version, name, environment: "client" })]];
+  const disabled = path.join(mods, "publisher-name.jar.disabled");
+  await createJar(disabled, mod("modmenu", "7.2.2", "Mod Menu"));
+  await createJar(path.join(mods, "modmenu.jar.disabled"), mod("othermod", "7.2.2"));
+  recordModpackInventory(folderPath, { name: server.modpack.name, packVersion: server.modpack.version, type: server.type });
+  await createJar(path.join(mods, "manually-added.jar.disabled"), mod("modmenu", "8.0.0"));
+  const candidate = await findBundledPackDependency(server);
+  assert.equal(candidate.name, "Mod Menu");
+  assert.deepEqual((await describeLocalInstalledAddons(server)).bundledDependency, { modId: "modmenu", name: "Mod Menu" });
+
+  const { transaction } = setAddonEnabled(server, candidate.id, true);
+  assert.equal(fs.existsSync(disabled), false);
+  assert.equal(fs.existsSync(path.join(mods, "publisher-name.jar")), true);
+  rollbackAddonTransaction(transaction);
+  assert.equal(fs.existsSync(disabled), true);
+  assert.equal(fs.existsSync(path.join(mods, "publisher-name.jar")), false);
+
+  const [requirement] = server.modpackSetup.diagnosis.requirements;
+  requirement.version = "version 8.0.0";
+  assert.equal(await findBundledPackDependency(server), null);
+  requirement.version = "version 7.2.2";
+  assert.equal((await findBundledPackDependency(server)).id, candidate.id);
+  requirement.version = "any version";
+  recordModpackInventory(folderPath, { name: server.modpack.name, packVersion: server.modpack.version, type: server.type });
+  assert.equal(await findBundledPackDependency(server), null);
+});
+
+test("existing mods are classified from their release or JAR, with unverified requirements kept separate", async () => {
+  const { server, folderPath, cleanup } = fixture("fabric");
+  try {
+    const mods = path.join(folderPath, "mods");
+    fs.mkdirSync(mods);
+    for (const [name, environment] of [["Both.jar", "*"], ["Server.jar", "server"], ["Disabled.jar.disabled", "*"]]) {
+      await createJar(path.join(mods, name), [["fabric.mod.json", JSON.stringify({ name, environment })]]);
+    }
+    fs.writeFileSync(path.join(mods, "Required.jar"), jarBuffer("required"));
+    fs.writeFileSync(path.join(folderPath, "addons-lock.json"), JSON.stringify({ entries: [
+      { fileName: "Required.jar", source: "modrinth", projectId: "project1", versionId: "release1", enabled: true },
+    ] }));
+    const listing = await describeLocalInstalledAddons(server);
+    const patches = await identifyInstalledAddons(server, listing, { fetchImpl: async (url) => {
+      switch (new URL(url).pathname) {
+        case "/v2/version_files": return jsonResponse({});
+        case "/v2/versions": return jsonResponse([{ id: "release1", project_id: "project1", environment: "client_and_server" }]);
+        case "/v2/projects": return jsonResponse([{ id: "project1", icon_url: "https://cdn.modrinth.com/data/project1/icon.png" }]);
+        default: assert.fail(url);
+      }
+    } });
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].environment, "client_and_server");
+    assert.match(patches[0].iconUrl, /project1\/icon\.png$/);
+    listing.items.find((item) => item.id === patches[0].id).environment = patches[0].environment;
+    assert.equal(listing.items.find((item) => item.fileName === "Server.jar").environment, "dedicated_server_only");
+    assert.deepEqual(clientModList(listing.items).map(([heading, items]) => [heading, items.map((item) => item.fileName)]), [
+      ["Required on clients", ["Required.jar"]],
+      ["Check with the mod author", ["Both.jar"]],
+    ]);
+  } finally { cleanup(); }
+});
+
+test("installed mods use local metadata across enabled and disabled files", async () => {
+  const { server, folderPath, cleanup } = fixture("forge");
+  try {
+    const mods = path.join(folderPath, "mods");
+    const lock = path.join(folderPath, "addons-lock.json");
+    fs.mkdirSync(mods);
+    const toml = [
+      "[[mods]]",
+      'modId = "example"',
+      'displayName = "Example\'s Mod" # display title',
+      'version = "${file.jarVersion}"',
+      'logoFile = "logo.png"',
+      'description = """',
+      '[[dependencies.example]]',
+      'modId = "minecraft"',
+      'versionRange = "[0]"',
+      '"""',
+      '[[dependencies.other_mod]]',
+      'modId = "minecraft"',
+      'versionRange = "[1.19]"',
+      '[[dependencies."example"]] # actual dependency',
+      'modId = "minecraft"',
+      'versionRange = "[1.20.1,1.21)"',
+      'side = "BOTH"',
+    ].join("\n");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j2R8AAAAASUVORK5CYII=", "base64");
+    const jar = path.join(mods, "example-release.jar");
+    await createJar(jar, [
+      ["fabric.mod.json", JSON.stringify({ name: "Fabric title", version: "3.0", environment: "client" })],
+      ["META-INF/mods.toml", toml],
+      ["META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\nImplementation-Version: 2.0.\r\n 0\r\n\r\n"],
+      ["logo.png", png],
+    ]);
+    fs.writeFileSync(path.join(mods, "unreadable.jar"), jarBuffer("not a zip"));
+
+    const quick = await scanServerAddons(server);
+    assert.equal(quick.items[0].fileName, "example-release.jar");
+    assert.equal(quick.items[0].iconUrl, "");
+    const listing = await describeLocalInstalledAddons(server, quick);
+    const [example, unreadable] = listing.items;
+    assert.equal(example.title, "Example's Mod");
+    assert.equal(example.versionNumber, "2.0.0");
+    assert.equal(example.loader, "forge");
+    assert.equal(example.minecraftVersion, "[1.20.1,1.21)");
+    assert.equal(example.environment, "");
+    assert.equal(example.managed, false);
+    assert.equal(example.projectId, null);
+    assert.equal(example.iconUrl, `data:image/png;base64,${png.toString("base64")}`);
+    assert.equal(unreadable.loader, "unknown");
+    assert.equal(fs.existsSync(lock), false);
+
+    const disabled = setAddonEnabled(server, example.id, false);
+    commitAddonTransaction(disabled.transaction);
+    const refreshed = (await describeLocalInstalledAddons(server)).items[0];
+    assert.equal(refreshed.id, example.id);
+    assert.equal(refreshed.enabled, false);
+    assert.equal(refreshed.title, example.title);
+    assert.equal(refreshed.versionNumber, example.versionNumber);
+    assert.equal(refreshed.minecraftVersion, example.minecraftVersion);
+    assert.equal(refreshed.iconUrl, example.iconUrl);
+    await createJar(`${jar}.disabled`, [["META-INF/mods.toml", toml.replace('logoFile = "logo.png"', 'logoFile = "missing.png"')]]);
+    const replaced = (await describeLocalInstalledAddons(server)).items[0];
+    assert.equal(replaced.iconUrl, "");
+    assert.notEqual(replaced.sha512, example.sha512);
+  } finally {
+    cleanup();
+  }
+});
+
+test("Modrinth identifies renamed JARs by their exact digest without adopting them", async () => {
+  const { server, folderPath, cleanup } = fixture();
+  try {
+    const mods = path.join(folderPath, "mods");
+    fs.mkdirSync(mods);
+    fs.writeFileSync(path.join(mods, "renamed.jar.disabled"), jarBuffer("exact match fixture"));
+    fs.writeFileSync(path.join(mods, "repacked.jar"), jarBuffer("different bytes"));
+    const listing = await scanServerAddons(server);
+    const [renamed, repacked] = ["renamed.jar", "repacked.jar"].map((fileName) => listing.items.find((item) => item.fileName === fileName));
+    const requests = [];
+    const options = { fetchImpl: async (url, request) => {
+      const route = new URL(url).pathname;
+      requests.push(route);
+      if (route === "/v2/version_files") {
+        const body = JSON.parse(request.body);
+        assert.equal(body.algorithm, "sha512");
+        assert.deepEqual(body.hashes.toSorted(), [renamed.sha512, repacked.sha512].toSorted());
+        const release = { id: "identified-release", project_id: "identified-project", version_number: "2.3.4", loaders: ["fabric"],
+          game_versions: ["1.21.1"], environment: "dedicated_server_only", files: [{ hashes: { sha512: renamed.sha512 } }] };
+        return jsonResponse({ [renamed.sha512]: release, [repacked.sha512]: release });
+      }
+      if (route === "/v2/projects") return jsonResponse([{ id: "identified-project", title: "Catalogue Title", icon_url: "https://cdn.modrinth.com/data/identified-project/logo.png" }]);
+      assert.fail(url);
+    } };
+    const patches = await identifyInstalledAddons(server, listing, options);
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].id, renamed.id);
+    assert.equal(patches[0].enabled, false);
+    assert.deepEqual(patches[0].catalogue, { source: "modrinth", projectId: "identified-project", versionId: "identified-release" });
+    assert.equal(patches[0].title, "Catalogue Title");
+    assert.equal(patches[0].iconUrl, "https://cdn.modrinth.com/data/identified-project/logo.png");
+    assert.deepEqual(await identifyInstalledAddons(server, listing, options), patches);
+    assert.deepEqual(requests, ["/v2/version_files", "/v2/projects"]);
+    assert.equal(fs.existsSync(path.join(folderPath, "addons-lock.json")), false);
+  } finally { cleanup(); }
 });
 
 test("search uses exact loader, game version, server environment, and identifying user agent", async () => {

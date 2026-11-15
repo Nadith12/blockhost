@@ -10,7 +10,18 @@
     <title>BlockHost Manager</title>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <div id="appView">
+        <div class="window-frame">
+          <header class="window-titlebar" id="windowTitlebar"></header>
+          <div class="app-shell library-shell" id="scene">
+            <div class="server-pages" id="serverPages"></div>
+          </div>
+        </div>
+        <div id="appOverlays"></div>
+      </div>
+      <dialog class="modal app-settings" id="appSettingsDialog" aria-labelledby="appSettingsTitle"></dialog>
+    </div>
     <script type="module" src="/src/renderer.js"></script>
   </body>
 </html>

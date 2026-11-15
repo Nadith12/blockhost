@@ -1,0 +1,69 @@
+name: Prepare Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag matching package.json, for example v2.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.repository == 'Nadith12/blockhost'
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Validate release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or $env:RELEASE_TAG -cne "v$version") {
+            throw 'Use a stable version tag matching package.json.'
+          }
+          $tagCommit = git rev-parse "refs/tags/$env:RELEASE_TAG^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne (git rev-parse HEAD)) {
+            throw 'The requested Git tag must already exist.'
+          }
+      - run: npm ci
+      - run: npm run check
+      - run: npm audit --omit=dev
+      - name: Build and verify the signed installer
+        env:
+          BLOCKHOST_WINDOWS_PUBLISHER: ${{ vars.BLOCKHOST_WINDOWS_PUBLISHER }}
+          BLOCKHOST_RELEASE_REPOSITORY: ${{ vars.BLOCKHOST_RELEASE_REPOSITORY }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npm run make:windows
+      - name: Smoke test the packaged renderer
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          npm exec -- electron test/smoke-renderer.cjs "out/windows-release/$version/win-unpacked/resources"
+      - name: Prepare a draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.BLOCKHOST_RELEASE_TOKEN || github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REPOSITORY: ${{ vars.BLOCKHOST_RELEASE_REPOSITORY || github.repository }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $output = "out/windows-release/$version"
+          $installer = "$output/BlockHostSetup-x64.exe"
+          gh release create $env:RELEASE_TAG $installer "$installer.blockmap" "$output/latest.yml" "$output/SHA256SUMS.txt" --repo $env:RELEASE_REPOSITORY --draft --verify-tag --generate-notes

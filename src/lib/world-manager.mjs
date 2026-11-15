@@ -14,14 +14,16 @@ const RATIO_MINIMUM_BYTES = 1024 * 1024;
 const ZIP_EPOCH = new Date("1980-01-01T00:00:00.000Z");
 const MANIFEST_NAME = "blockhost-world.json";
 const SKIPPED_FILES = new Set(["session.lock"]);
+const DIMENSION_SUFFIXES = ["", "_nether", "_the_end"];
 
 function emitProgress(listener, stage, percent, message) {
   listener?.({ stage, percent: Math.max(0, Math.min(100, Math.round(percent))), message });
 }
 
 function safeWorldName(value) {
-  const name = String(value || "world").trim();
-  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\") || name.includes("\0")) {
+  const name = String(value || "world");
+  if (!name || /[<>:"/\\|?*\x00-\x1f]|[. ]$/.test(name)
+    || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name)) {
     throw new Error("The configured world folder name is unsafe");
   }
   return name;
@@ -36,11 +38,11 @@ function configuredWorldName(serverFolder) {
 
 function worldCandidates(serverFolder) {
   const name = configuredWorldName(serverFolder);
-  return [
-    { sourceName: name, archiveName: "world" },
-    { sourceName: `${name}_nether`, archiveName: "world_nether" },
-    { sourceName: `${name}_the_end`, archiveName: "world_the_end" },
-  ].map((item) => ({ ...item, sourcePath: assertPathInside(serverFolder, path.join(serverFolder, item.sourceName)) }));
+  return DIMENSION_SUFFIXES.map(suffix => ({
+    sourceName: `${name}${suffix}`,
+    archiveName: `world${suffix}`,
+    sourcePath: assertPathInside(serverFolder, path.join(serverFolder, `${name}${suffix}`)),
+  }));
 }
 
 function collectWorldFiles(serverFolder) {
@@ -183,27 +185,70 @@ async function extractZip(source, destination, onProgress) {
   });
 }
 
-function copyTree(sourceRoot, destinationRoot) {
+async function copyTree(sourceRoot, destinationRoot, signal) {
   let totalBytes = 0;
   let entries = 0;
-  const walk = (source, destination) => {
-    fs.mkdirSync(destination, { recursive: true });
-    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+  const walk = async (source, destination) => {
+    await fs.promises.mkdir(destination, { recursive: true });
+    for (const entry of await fs.promises.readdir(source, { withFileTypes: true })) {
+      signal?.throwIfAborted();
       if (SKIPPED_FILES.has(entry.name.toLowerCase())) continue;
       entries += 1;
       if (entries > MAX_ENTRIES) throw new Error("The world contains too many files");
       const sourcePath = path.join(source, entry.name);
       const destinationPath = assertPathInside(destinationRoot, path.join(destination, entry.name));
       if (entry.isSymbolicLink()) throw new Error(`Symbolic links cannot be imported (${entry.name})`);
-      if (entry.isDirectory()) walk(sourcePath, destinationPath);
+      if (entry.isDirectory()) await walk(sourcePath, destinationPath);
       else if (entry.isFile()) {
-        totalBytes += fs.statSync(sourcePath).size;
+        totalBytes += (await fs.promises.stat(sourcePath)).size;
         if (totalBytes > MAX_WORLD_BYTES) throw new Error("The world is too large to import safely");
-        fs.copyFileSync(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+        if (signal) {
+          await pipeline(fs.createReadStream(sourcePath), fs.createWriteStream(destinationPath, { flags: "wx" }), { signal });
+        } else {
+          await fs.promises.copyFile(sourcePath, destinationPath, fs.constants.COPYFILE_EXCL);
+        }
       } else throw new Error(`Unsupported world file type (${entry.name})`);
     }
   };
-  walk(sourceRoot, destinationRoot);
+  await walk(sourceRoot, destinationRoot);
+}
+
+export async function createTrialWorld(serverFolder, worldName, signal) {
+  const root = await fs.promises.realpath(serverFolder);
+  const sourceName = safeWorldName(worldName);
+  signal?.throwIfAborted();
+  const trial = await fs.promises.mkdtemp(path.join(root, ".blockhost-test-world-"));
+  const owned = [trial];
+  const remove = async () => {
+    const results = await Promise.allSettled(owned.map(folder => fs.promises.rm(
+      assertPathInside(root, folder), { recursive: true, force: true, maxRetries: 3 },
+    )));
+    const failed = results.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
+  };
+  try {
+    for (const suffix of DIMENSION_SUFFIXES) {
+      signal?.throwIfAborted();
+      const destination = assertPathInside(root, `${trial}${suffix}`);
+      if (suffix) {
+        await fs.promises.mkdir(destination);
+        owned.push(destination);
+      }
+      const source = assertPathInside(root, path.join(root, `${sourceName}${suffix}`));
+      const stat = await fs.promises.lstat(source).catch(error => {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+      });
+      if (!stat) continue;
+      if (!stat.isDirectory()) throw new Error("The configured world must be a folder inside the server setup.");
+      await copyTree(source, destination, signal);
+    }
+    signal?.throwIfAborted();
+    return { name: path.basename(trial), remove };
+  } catch (error) {
+    await remove();
+    throw error;
+  }
 }
 
 function findWorldSet(sourceRoot) {
@@ -244,7 +289,7 @@ export async function importWorld(sourcePath, serverFolder, options = {}) {
     fs.mkdirSync(extracted, { recursive: true });
     if (fs.statSync(source).isDirectory()) {
       emitProgress(options.onProgress, "copy", 10, "Reading the selected world folder…");
-      copyTree(source, extracted);
+      await copyTree(source, extracted);
     } else if (path.extname(source).toLowerCase() === ".zip") {
       await extractZip(source, extracted, options.onProgress);
     } else throw new Error("Choose a Minecraft world folder or ZIP file");
@@ -253,7 +298,7 @@ export async function importWorld(sourcePath, serverFolder, options = {}) {
     for (const item of worldSet) {
       const destination = assertPathInside(root, path.join(root, item.destination));
       if (fs.existsSync(destination)) throw new Error(`The destination already contains ${item.destination}`);
-      copyTree(item.source, destination);
+      await copyTree(item.source, destination);
     }
     const propertiesPath = path.join(root, "server.properties");
     const existing = fs.existsSync(propertiesPath) ? fs.readFileSync(propertiesPath, "utf8") : "";

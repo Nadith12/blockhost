@@ -1,27 +1,31 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { Transform } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import yauzl from "yauzl";
 import yazl from "yazl";
 import { atomicWriteFile, assertPathInside } from "./safe-filesystem.mjs";
+import { discardImportedAddonJournals, getAddonProfile } from "./addon-manager.mjs";
+import { normalizeServerIcon } from "./app-themes.mjs";
 
 export const BLOCKHOST_FORMAT = "blockhost-server";
-export const BLOCKHOST_FORMAT_VERSION = 1;
+export const BLOCKHOST_FORMAT_VERSION = 2;
 
 const MANIFEST_PATH = "manifest.json";
 const SERVER_PREFIX = "server/";
 const MAX_ENTRIES = 100_000;
 const MAX_MANIFEST_BYTES = 2 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO = 500;
 const RATIO_CHECK_MIN_BYTES = 1024 * 1024;
 const EXTRA_DISK_BYTES = 64 * 1024 * 1024;
 const ZIP_EPOCH = new Date("1980-01-01T00:00:00.000Z");
-const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
+const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge", "quilt", "purpur"]);
 const EXCLUDED_DIRECTORIES = new Set([
   ".blockhost-addon-backup",
+  ".blockhost-backup.json",
   ".blockhost-addon-staging",
   ".blockhost-import-staging",
   ".blockhost-transfer-staging",
@@ -52,14 +56,18 @@ function sha256Buffer(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
-async function hashFile(filePath) {
+async function hashFile(filePath, providerAlgorithm) {
   const hash = crypto.createHash("sha256");
+  const providerHash = providerAlgorithm && providerAlgorithm !== "sha256"
+    ? crypto.createHash(providerAlgorithm) : null;
   let size = 0;
   for await (const chunk of fs.createReadStream(filePath)) {
     size += chunk.length;
     hash.update(chunk);
+    providerHash?.update(chunk);
   }
-  return { size, sha256: hash.digest("hex") };
+  const sha256 = hash.digest("hex");
+  return { size, sha256, providerHash: providerHash?.digest("hex") || sha256 };
 }
 
 function portablePath(value, label = "archive path") {
@@ -70,7 +78,8 @@ function portablePath(value, label = "archive path") {
   const directory = text.endsWith("/");
   const parts = text.split("/");
   if (directory) parts.pop();
-  if (!parts.length || parts.some((part) => !part || part === "." || part === "..")) {
+  if (!parts.length || parts.some((part) => !part || /[\x00-\x1f<>:"|?*]|[. ]$/.test(part)
+    || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) {
     throw new Error(`Invalid ${label}`);
   }
   return `${parts.join("/")}${directory ? "/" : ""}`;
@@ -98,6 +107,7 @@ function shouldExclude(relativePath, directory) {
   const name = parts.at(-1);
   return name === "session.lock"
     || name === "server-info.pre-blockhost-v3.json"
+    || name.startsWith(".blockhost-addon-journal-")
     || name.endsWith(".blockhost-backup")
     || name.includes(".blockhost-partial-");
 }
@@ -125,6 +135,11 @@ function collectServerFiles(server) {
   return files;
 }
 
+function archiveJarName(server) {
+  const launcher = { fabric: "fabric-server-launch.jar", quilt: "quilt-server-launch.jar" }[server.type];
+  return launcher && server.jarFile === launcher ? launcher : "server.jar";
+}
+
 function portableMetadata(server) {
   return {
     schemaVersion: 3,
@@ -133,14 +148,91 @@ function portableMetadata(server) {
     type: String(server.type),
     version: String(server.version),
     loaderVersion: String(server.loaderVersion || ""),
+    minecraftJavaMajor: server.minecraftJavaMajor,
+    recommendedJavaMajor: server.recommendedJavaMajor,
     color: String(server.color || "#39c9ff"),
+    icon: normalizeServerIcon(server.icon),
     launchType: server.launchType === "javaArgsFile" ? "javaArgsFile" : "jar",
-    jarFile: server.launchType === "javaArgsFile" ? "" : "server.jar",
+    jarFile: server.launchType === "javaArgsFile" ? "" : archiveJarName(server),
     launchArgsPath: server.launchType === "javaArgsFile" ? relativeLaunchPath(server.launchArgsPath) : "",
     createdAt: String(server.createdAt || ""),
     lastModifiedAt: String(server.lastModifiedAt || server.createdAt || ""),
     addonsManifestVersion: 1,
+    minMemoryMb: Number(server.minMemoryMb) || 512,
+    maxMemoryMb: Number(server.maxMemoryMb) || 0,
   };
+}
+
+function archiveDownload(value, server, filePath) {
+  if (typeof value?.url !== "string" || value.url.length > 2048) return null;
+  let url;
+  try { url = new URL(value.url); } catch { return null; }
+  if (url.protocol !== "https:" || url.port || url.username || url.password || url.search || url.hash) return null;
+
+  if (filePath === "server/server.jar" && server.launchType !== "javaArgsFile" && value.provider === server.type) {
+    if (server.type === "vanilla" && url.hostname === "piston-data.mojang.com"
+      && /^\/v1\/objects\/[a-f0-9]{40}\/server\.jar$/.test(url.pathname)) {
+      return { provider: "vanilla", url: url.href };
+    }
+    if (server.type === "paper" && url.hostname === "fill-data.papermc.io"
+      && /^\/v1\/objects\/[a-f0-9]{64}\/paper-[^/]+\.jar$/.test(url.pathname)) {
+      return { provider: "paper", url: url.href };
+    }
+  }
+
+  const profile = getAddonProfile(server);
+  const { projectId, versionId } = value;
+  if (value.provider !== "modrinth" || url.hostname !== "cdn.modrinth.com" || !profile.supported
+    || typeof projectId !== "string" || !/^[a-z0-9]{1,32}$/i.test(projectId)
+    || typeof versionId !== "string" || !/^[a-z0-9]{1,32}$/i.test(versionId)) return null;
+  const prefix = `server/${profile.directory}/`;
+  if (!filePath.startsWith(prefix) || !/^[^/]+\.jar(?:\.disabled)?$/i.test(filePath.slice(prefix.length))) return null;
+  const downloadPrefix = `/data/${projectId}/versions/${versionId}/`;
+  if (!url.pathname.startsWith(downloadPrefix) || !/^[^/]+\.jar$/i.test(url.pathname.slice(downloadPrefix.length))) return null;
+  return { provider: "modrinth", url: url.href, projectId, versionId };
+}
+
+function addonDownloadCandidates(server, sourceFiles) {
+  const candidates = new Map();
+  const lockFile = sourceFiles.find((file) => file.relativePath === "addons-lock.json");
+  if (!lockFile) return candidates;
+  let lock;
+  try { lock = JSON.parse(fs.readFileSync(lockFile.sourcePath, "utf8")); } catch { return candidates; }
+  if (!Array.isArray(lock?.entries)) return candidates;
+  const profile = getAddonProfile(server);
+  if (!profile.supported) return candidates;
+  for (const entry of lock.entries) {
+    if (entry?.source !== "modrinth" || typeof entry.fileName !== "string"
+      || !/^[^/\\]+\.jar$/i.test(entry.fileName) || !/^[a-f0-9]{128}$/i.test(entry.sha512 || "")) continue;
+    const filename = entry.enabled === false ? `${entry.fileName}.disabled` : entry.fileName;
+    const filePath = `server/${profile.directory}/${filename}`;
+    const download = archiveDownload({
+      provider: "modrinth",
+      url: entry.sourceUrl,
+      projectId: entry.projectId,
+      versionId: entry.versionId,
+    }, server, filePath);
+    if (download) candidates.set(filePath.toLowerCase(), { download, algorithm: "sha512", digest: entry.sha512.toLowerCase() });
+  }
+  return candidates;
+}
+
+async function serverDownloadCandidate(server, resolveServerDownload) {
+  let info = server.serverDownload;
+  if (!info && resolveServerDownload) {
+    // Legacy servers can still use a reference if the current provider artifact
+    // matches the local file byte for byte. Offline exports embed the file.
+    try { info = await resolveServerDownload(server); } catch {}
+  }
+  const download = archiveDownload({ provider: server.type, url: info?.url }, server, "server/server.jar");
+  if (!download) return null;
+  if (/^[a-f0-9]{64}$/i.test(info.sha256 || "")) {
+    return { download, algorithm: "sha256", digest: info.sha256.toLowerCase() };
+  }
+  if (/^[a-f0-9]{40}$/i.test(info.sha1 || "")) {
+    return { download, algorithm: "sha1", digest: info.sha1.toLowerCase() };
+  }
+  return null;
 }
 
 function openZip(filePath) {
@@ -226,7 +318,7 @@ function validateZipEntry(entry) {
 function validateManifest(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The BlockHost manifest is invalid");
   if (value.format !== BLOCKHOST_FORMAT) throw new Error("This is not a BlockHost server archive");
-  if (value.formatVersion !== BLOCKHOST_FORMAT_VERSION) {
+  if (value.formatVersion !== 1 && value.formatVersion !== BLOCKHOST_FORMAT_VERSION) {
     throw new Error(`BlockHost archive version ${value.formatVersion} is not supported`);
   }
   if (!value.server || typeof value.server !== "object") throw new Error("The BlockHost archive has no server metadata");
@@ -251,12 +343,19 @@ function validateManifest(value) {
     if (!Number.isSafeInteger(totalSize) || totalSize > MAX_UNCOMPRESSED_BYTES) {
       throw new Error("The BlockHost archive is too large to import safely");
     }
-    files.set(key, { path: filePath, size, sha256 });
+    let download;
+    if (file.download !== undefined) {
+      download = archiveDownload(file.download, value.server, filePath);
+      if (value.formatVersion !== BLOCKHOST_FORMAT_VERSION || !download || size <= 0 || size > MAX_DOWNLOAD_BYTES) {
+        throw new Error(`Invalid download reference for ${filePath}`);
+      }
+    }
+    files.set(key, { path: filePath, size, sha256, download });
   }
 
   const launchType = value.server.launchType === "javaArgsFile" ? "javaArgsFile" : "jar";
   const requiredPath = launchType === "jar"
-    ? "server/server.jar"
+    ? SERVER_PREFIX + archiveJarName(value.server)
     : `${SERVER_PREFIX}${relativeLaunchPath(value.server.launchArgsPath)}`;
   if (!files.has(requiredPath.toLowerCase())) throw new Error("The BlockHost archive is missing its server launch files");
   return { manifest: value, files, totalSize, launchType };
@@ -300,14 +399,16 @@ export async function inspectBlockhostArchive(filePath, options = {}) {
     if (item.directory || key === MANIFEST_PATH) continue;
     const declared = validated.files.get(key);
     if (!declared) throw new Error(`The archive contains an undeclared file: ${item.name}`);
+    if (declared.download) throw new Error(`The archive contains both a download and a copy of ${item.name}`);
     if (declared.size !== item.entry.uncompressedSize) throw new Error(`File size does not match the manifest: ${item.name}`);
   }
   for (const declared of validated.files.values()) {
-    if (!archiveEntries.has(declared.path.toLowerCase())) throw new Error(`The archive is missing ${declared.path}`);
+    if (!declared.download && !archiveEntries.has(declared.path.toLowerCase())) throw new Error(`The archive is missing ${declared.path}`);
   }
 
   if (options.verifyPayload) {
     let verified = 0;
+    const embeddedCount = [...validated.files.values()].filter((file) => !file.download).length;
     await forEachZipEntry(archivePath, async (entry, zip) => {
       const { name, directory } = validateZipEntry(entry);
       if (directory || name.toLowerCase() === MANIFEST_PATH) return;
@@ -315,7 +416,7 @@ export async function inspectBlockhostArchive(filePath, options = {}) {
       const actual = await hashZipEntry(zip, entry);
       if (actual.size !== declared.size || actual.sha256 !== declared.sha256) throw new Error(`File verification failed: ${name}`);
       verified += 1;
-      emitProgress(options.onProgress, "verify", 75 + (verified / validated.files.size) * 25, `Verifying ${verified} of ${validated.files.size} files…`);
+      emitProgress(options.onProgress, "verify", 75 + (verified / embeddedCount) * 25, `Verifying ${verified} of ${embeddedCount} files…`);
     });
   }
 
@@ -402,15 +503,19 @@ export async function exportBlockhostServer(server, destination, options = {}) {
     emitProgress(onProgress, "scan", 3, "Scanning the server files…");
     const metadata = portableMetadata(server);
     const metadataBuffer = Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`, "utf8");
-    let sourceFiles = collectServerFiles(server).filter((file) => {
+    const jarPath = metadata.launchType === "jar"
+      ? path.resolve(server.jarPath || path.join(server.folderPath, "server.jar")) : "";
+    const sourceFiles = collectServerFiles(server).filter((file) => {
       const lower = file.relativePath.toLowerCase();
       if (lower === "server-info.json") return false;
-      return !(metadata.launchType === "jar" && lower === "server.jar");
+      return !(jarPath && (lower === metadata.jarFile || file.sourcePath === jarPath));
     });
-    if (metadata.launchType === "jar") {
-      const jarPath = path.resolve(server.jarPath || path.join(server.folderPath, "server.jar"));
+    const downloadCandidates = addonDownloadCandidates(server, sourceFiles);
+    if (jarPath) {
       if (!fs.existsSync(jarPath) || !fs.statSync(jarPath).isFile()) throw new Error("The server JAR is missing and cannot be exported");
-      sourceFiles.push({ sourcePath: jarPath, relativePath: "server.jar" });
+      sourceFiles.push({ sourcePath: jarPath, relativePath: metadata.jarFile });
+      const candidate = metadata.jarFile === "server.jar" ? await serverDownloadCandidate(server, options.resolveServerDownload) : null;
+      if (candidate) downloadCandidates.set("server/server.jar", candidate);
     }
 
     const seen = new Set();
@@ -425,21 +530,31 @@ export async function exportBlockhostServer(server, destination, options = {}) {
 
     const totalSourceBytes = entries.reduce((sum, entry) => sum + (entry.buffer?.length || fs.statSync(entry.sourcePath).size), 0);
     if (totalSourceBytes > MAX_UNCOMPRESSED_BYTES) throw new Error("This server is too large to export safely");
-    assertDiskSpace(path.dirname(target), totalSourceBytes + EXTRA_DISK_BYTES);
-
     const files = [];
+    const embedded = [];
+    let embeddedBytes = 0;
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
+      const candidate = downloadCandidates.get(entry.archivePath.toLowerCase());
       const actual = entry.buffer
         ? { size: entry.buffer.length, sha256: sha256Buffer(entry.buffer) }
-        : await hashFile(entry.sourcePath);
-      files.push({ path: entry.archivePath, size: actual.size, sha256: actual.sha256 });
+        : await hashFile(entry.sourcePath, candidate?.algorithm);
+      const file = { path: entry.archivePath, size: actual.size, sha256: actual.sha256 };
+      if (candidate && actual.size > 0 && actual.size <= MAX_DOWNLOAD_BYTES && actual.providerHash === candidate.digest) {
+        file.download = candidate.download;
+      } else {
+        embedded.push(entry);
+        embeddedBytes += actual.size;
+      }
+      files.push(file);
       emitProgress(onProgress, "hash", 5 + ((index + 1) / entries.length) * 30, `Preparing ${index + 1} of ${entries.length} files…`);
     }
 
+    const downloadCount = files.length - embedded.length;
+    assertDiskSpace(path.dirname(target), embeddedBytes + EXTRA_DISK_BYTES);
     const manifest = {
       format: BLOCKHOST_FORMAT,
-      formatVersion: BLOCKHOST_FORMAT_VERSION,
+      formatVersion: downloadCount ? BLOCKHOST_FORMAT_VERSION : 1,
       createdAt: new Date().toISOString(),
       createdBy: String(options.createdBy || "BlockHost Manager"),
       server: {
@@ -448,19 +563,21 @@ export async function exportBlockhostServer(server, destination, options = {}) {
         minecraftVersion: metadata.version,
         loaderVersion: metadata.loaderVersion,
         color: metadata.color,
+        icon: metadata.icon,
         launchType: metadata.launchType,
+        ...(metadata.jarFile && metadata.jarFile !== "server.jar" ? { jarFile: metadata.jarFile } : {}),
         launchArgsPath: metadata.launchArgsPath,
       },
       files,
     };
 
-    emitProgress(onProgress, "archive", 40, "Creating the self-contained archive…");
-    await writeZip(temporary, entries, manifest);
+    emitProgress(onProgress, "archive", 40, "Creating the server archive…");
+    await writeZip(temporary, embedded, manifest);
     emitProgress(onProgress, "verify", 75, "Verifying the completed archive…");
     await inspectBlockhostArchive(temporary, { verifyPayload: true, onProgress });
     await renameWithRetries(temporary, target);
     emitProgress(onProgress, "complete", 100, "Export complete.");
-    return { path: target, fileName: path.basename(target), fileCount: files.length, totalBytes: totalSourceBytes };
+    return { path: target, fileName: path.basename(target), fileCount: files.length, totalBytes: totalSourceBytes, downloadCount, archiveBytes: fs.statSync(target).size };
   } catch (error) {
     if (fs.existsSync(temporary)) fs.rmSync(temporary, { force: true });
     throw error;
@@ -490,6 +607,7 @@ function nextServerId(serversRoot, existingIds) {
 async function extractArchive(archivePath, destinationRoot, inspected, onProgress) {
   let extracted = 0;
   const seen = new Set();
+  const embeddedCount = [...inspected.files.values()].filter((file) => !file.download).length;
   await forEachZipEntry(archivePath, async (entry, zip) => {
     const { name, directory } = validateZipEntry(entry);
     if (name.toLowerCase() === MANIFEST_PATH) return;
@@ -502,7 +620,7 @@ async function extractArchive(archivePath, destinationRoot, inspected, onProgres
       return;
     }
     const declared = inspected.files.get(name.toLowerCase());
-    if (!declared) throw new Error(`Undeclared archive entry: ${name}`);
+    if (!declared || declared.download) throw new Error(`Undeclared archive entry: ${name}`);
     fs.mkdirSync(path.dirname(output), { recursive: true });
     const hash = crypto.createHash("sha256");
     let size = 0;
@@ -523,7 +641,41 @@ async function extractArchive(archivePath, destinationRoot, inspected, onProgres
     extracted += 1;
     emitProgress(onProgress, "extract", 20 + (extracted / inspected.fileCount) * 65, `Restoring ${extracted} of ${inspected.fileCount} files…`);
   });
-  if (seen.size !== inspected.fileCount) throw new Error("The BlockHost archive did not restore every declared file");
+  if (seen.size !== embeddedCount) throw new Error("The BlockHost archive did not restore every included file");
+}
+
+async function restoreArchiveDownloads(destinationRoot, inspected, { fetchImpl = fetch, onProgress } = {}) {
+  const downloads = [...inspected.files.values()].filter((file) => file.download);
+  for (const [index, file] of downloads.entries()) {
+    const relative = file.path.slice(SERVER_PREFIX.length);
+    const output = assertPathInside(destinationRoot, path.join(destinationRoot, ...relative.split("/")));
+    emitProgress(onProgress, "download", 85 + (index / downloads.length) * 6, `Downloading ${path.basename(relative)} (${index + 1} of ${downloads.length})…`);
+    try {
+      const response = await fetchImpl(file.download.url, {
+        redirect: "error",
+        signal: AbortSignal.timeout(300_000),
+        headers: { "User-Agent": "BlockHostManager (https://apps.microsoft.com/detail/9N8GF88CX85V)" },
+      });
+      if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+      const hash = crypto.createHash("sha256");
+      let size = 0;
+      const verifier = new Transform({
+        transform(chunk, _encoding, callback) {
+          size += chunk.length;
+          if (size > file.size) return callback(new Error("The download was larger than expected"));
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
+      fs.mkdirSync(path.dirname(output), { recursive: true });
+      await pipeline(Readable.fromWeb(response.body), verifier, fs.createWriteStream(output, { flags: "wx" }));
+      if (size !== file.size || hash.digest("hex") !== file.sha256) {
+        throw new Error("The download did not match the original file");
+      }
+    } catch (error) {
+      throw new Error(`Could not restore ${path.basename(relative)}. Compact exports need access to the original download. ${error.message}`, { cause: error });
+    }
+  }
 }
 
 export async function importBlockhostServer(archivePath, serversRoot, existingServers = [], options = {}) {
@@ -545,12 +697,13 @@ export async function importBlockhostServer(archivePath, serversRoot, existingSe
     fs.mkdirSync(extractedServer, { recursive: true });
     emitProgress(options.onProgress, "extract", 15, "Restoring the server into a safe staging area…");
     await extractArchive(path.resolve(archivePath), extractedServer, inspected, options.onProgress);
+    await restoreArchiveDownloads(extractedServer, inspected, options);
 
     const manifestServer = inspected.manifest.server;
     const launchType = manifestServer.launchType === "javaArgsFile" ? "javaArgsFile" : "jar";
     const launchArgsPath = launchType === "javaArgsFile" ? relativeLaunchPath(manifestServer.launchArgsPath) : "";
     const launchFile = launchType === "jar"
-      ? path.join(extractedServer, "server.jar")
+      ? path.join(extractedServer, archiveJarName(manifestServer))
       : path.join(extractedServer, ...launchArgsPath.split("/"));
     if (!fs.existsSync(launchFile) || !fs.statSync(launchFile).isFile()) throw new Error("The imported server launch files are missing");
 
@@ -565,26 +718,35 @@ export async function importBlockhostServer(archivePath, serversRoot, existingSe
       type: String(manifestServer.type || "vanilla"),
       version: String(manifestServer.minecraftVersion || "unknown"),
       loaderVersion: String(manifestServer.loaderVersion || ""),
+      minecraftJavaMajor: Number(sourceMetadata.minecraftJavaMajor) || undefined,
+      recommendedJavaMajor: Number(sourceMetadata.recommendedJavaMajor) || undefined,
       color: /^#[0-9a-f]{6}$/i.test(String(manifestServer.color || "")) ? manifestServer.color : "#39c9ff",
+      icon: normalizeServerIcon(manifestServer.icon ?? sourceMetadata.icon),
       launchType,
-      jarFile: launchType === "jar" ? "server.jar" : "",
+      jarFile: launchType === "jar" ? archiveJarName(manifestServer) : "",
       launchArgsPath,
       createdAt: now,
       lastModifiedAt: now,
       addonsManifestVersion: Number(sourceMetadata.addonsManifestVersion) || 1,
+      minMemoryMb: Number(sourceMetadata.minMemoryMb) || 512,
+      maxMemoryMb: Number(sourceMetadata.maxMemoryMb) || 0,
       importedAt: now,
     };
+    const serverJar = inspected.files.get(SERVER_PREFIX + archiveJarName(manifestServer));
+    if (launchType === "jar" && serverJar?.download) {
+      metadata.serverDownload = { url: serverJar.download.url, sha256: serverJar.sha256 };
+    }
+    Object.assign(metadata, await options.prepareMetadata?.(extractedServer, metadata));
     atomicWriteFile(sourceMetadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
     const eula = path.join(extractedServer, "eula.txt");
     if (fs.existsSync(eula)) fs.rmSync(eula, { force: true });
+    fs.rmSync(path.join(extractedServer, ".blockhost-backup.json"), { force: true });
+    discardImportedAddonJournals(extractedServer);
 
     emitProgress(options.onProgress, "commit", 92, "Adding the restored server to BlockHost…");
     await renameWithRetries(extractedServer, destination);
     emitProgress(options.onProgress, "complete", 100, "Import complete.");
     return { server: metadata, path: destination, fileCount: inspected.fileCount, totalBytes: inspected.totalSize };
-  } catch (error) {
-    if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
-    throw error;
   } finally {
     if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true });
     await removeEmptyDirectoryWithRetries(stagingParent);

@@ -96,13 +96,24 @@ export function parseConsoleLine(value, options = {}) {
   };
 }
 
+export function isFabricDependencyError(message) {
+  return /^Incompatible mods found!$|^Incompatible mod set!?$/i.test(message);
+}
+
 export function attachErrorGroup(entry, state = {}) {
   const next = { ...entry };
-  if (next.errorStart) {
+  const fabricDetail = state.fabricDependencyReport && !next.minecraftTime && /^(?:A potential solution\b|More details:|\s+-\s)/i.test(next.message);
+  if (fabricDetail) {
+    next.level = next.category = "error";
+    next.errorStart = false;
+    next.errorGroupId = state.activeGroupId;
+  } else if (next.errorStart) {
     state.sequence = (Number(state.sequence) || 0) + 1;
     state.activeGroupId = `error-${state.sequence}`;
+    state.fabricDependencyReport = isFabricDependencyError(next.message);
   } else if (!next.stackTrace) {
     state.activeGroupId = "";
+    state.fabricDependencyReport = false;
   }
   if ((next.errorStart || next.stackTrace) && state.activeGroupId) {
     next.errorGroupId = state.activeGroupId;

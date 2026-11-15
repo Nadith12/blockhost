@@ -3,7 +3,9 @@ module.exports = {
     asar: true,
     prune: true,
     icon: 'assets/app-icon',
-    extraResource: ['./assets'],
+    // Store artwork and MSIX branding stay available to their makers, but are
+    // not runtime resources. Only these two icons are loaded by the app.
+    extraResource: ['./assets/app-icon.png', './assets/app-icon-32.png'],
   },
   rebuildConfig: {},
   makers: [
@@ -14,6 +16,16 @@ module.exports = {
     {
       name: '@electron-forge/maker-zip',
       platforms: ['darwin', 'win32'],
+    },
+    {
+      name: '@electron-forge/maker-msix',
+      config: {
+        appManifest: './Package.appxmanifest',
+        packageAssets: './assets/msix',
+        windowsKitVersion: '10.0.26100.0',
+        createPri: true,
+        sign: false,
+      },
     },
     {
       name: '@electron-forge/maker-deb',

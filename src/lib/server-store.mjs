@@ -6,7 +6,7 @@ import {
   migrateServerMetadata,
 } from "./server-metadata.mjs";
 
-const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge"]);
+const SERVER_TYPES = new Set(["vanilla", "paper", "fabric", "forge", "neoforge", "quilt", "purpur"]);
 const DEFAULT_COLOR = "#39c9ff";
 
 function readJson(filePath, fallback = null) {
@@ -22,6 +22,8 @@ export function serverTypeLabel(type) {
   return {
     vanilla: "Vanilla",
     paper: "Paper",
+    purpur: "Purpur",
+    quilt: "Quilt",
     fabric: "Fabric",
     forge: "Forge",
     neoforge: "NeoForge",
